@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/openabstractions/abstraction-identity"
 )
 
 type failedWriter struct{}
@@ -30,7 +32,7 @@ func TestRuntimeDesignationComesFromProviderInstallation(t *testing.T) {
 		t.Fatal(err)
 	}
 	programs, err := runtimeProgramsAt(filepath.Join(dir, "modelhostd"), nil)
-	if err != nil || len(programs) != 1 || programs[0] != installed {
+	if err != nil || len(programs) != 1 || programs[0] != identity.CanonicalProgramPath(installed) {
 		t.Fatalf("installed programs = %v, %v", programs, err)
 	}
 	if runtime.GOOS == "windows" {
@@ -39,7 +41,7 @@ func TestRuntimeDesignationComesFromProviderInstallation(t *testing.T) {
 			t.Fatal(err)
 		}
 		programs, err = runtimeProgramsAt(filepath.Join(dir, "modelhostd.exe"), nil)
-		if err != nil || len(programs) != 2 || programs[1] != windowless {
+		if err != nil || len(programs) != 2 || programs[1] != identity.CanonicalProgramPath(windowless) {
 			t.Fatalf("windowless runtime = %v, %v", programs, err)
 		}
 	}
@@ -48,7 +50,7 @@ func TestRuntimeDesignationComesFromProviderInstallation(t *testing.T) {
 		t.Fatal(err)
 	}
 	programs, err = runtimeProgramsAt(filepath.Join(dir, "modelhostd"), []string{explicit})
-	if err != nil || len(programs) != 1 || programs[0] != explicit {
+	if err != nil || len(programs) != 1 || programs[0] != identity.CanonicalProgramPath(explicit) {
 		t.Fatalf("explicit program = %v, %v", programs, err)
 	}
 }
