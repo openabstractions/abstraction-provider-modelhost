@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/llamacpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/llamacpp"
 )
 
 // b10825 review condition 2 (CONTRACT.md MODELHOST-L5): a person's engine
@@ -155,6 +155,26 @@ func TestEngineArgumentsAreCanonical(t *testing.T) {
 	}
 }
 
+func TestEngineArgumentsRefuseProviderOwnedCacheOptions(t *testing.T) {
+	for _, flag := range []string{"--cache-ram", "-cram", "--ctx-checkpoints", "-ctxcp", "--swa-checkpoints", "--cache-reuse", "--slot-save-path"} {
+		for _, args := range [][]string{{flag, "1"}, {flag + "=1"}} {
+			t.Run(strings.Join(args, " "), func(t *testing.T) {
+				if got, err := EngineArguments(args); !errors.Is(err, ErrEngineArgument) || !strings.Contains(err.Error(), flag) {
+					t.Fatalf("EngineArguments(%q) = %q, %v; want refusal naming %s", args, got, err, flag)
+				}
+				options := Options{Models: []Model{{Name: "tiny:1b", Store: "fake", Object: "tiny"}},
+					Engine: Engine{Arguments: args}, Source: fakeSource{}, Leases: newFakeLeases()}
+				if h, err := newTestHost(options); !errors.Is(err, ErrEngineArgument) {
+					if h != nil {
+						h.Close()
+					}
+					t.Fatalf("New with %q = %v; want ErrEngineArgument before an engine starts", args, err)
+				}
+			})
+		}
+	}
+}
+
 // A host configured with an argument outside the list is refused at New, so
 // no call ever starts an engine with it.
 func TestHostRefusesAnEngineArgumentOutsideTheList(t *testing.T) {
@@ -163,7 +183,7 @@ func TestHostRefusesAnEngineArgumentOutsideTheList(t *testing.T) {
 		Engine: Engine{Arguments: []string{"--rpc", "10.0.0.2:50052"}},
 		Source: fakeSource{}, Leases: newFakeLeases(),
 	}
-	h, err := New(options)
+	h, err := newTestHost(options)
 	if err == nil {
 		h.Close()
 		t.Fatal("a host with --rpc was made")

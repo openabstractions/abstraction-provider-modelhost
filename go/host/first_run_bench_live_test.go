@@ -79,7 +79,7 @@ func TestLiveFirstRunRankOneBench(t *testing.T) {
 	if mode == "plain-fit" {
 		args = append(args, "--no-mmap", "--n-gpu-layers", "auto")
 	}
-	h, err := New(Options{
+	h, err := newTestHost(Options{
 		Models: []Model{{Name: name, Store: "live", Object: "rank-one"}},
 		Engine: Engine{Program: program, Pin: pin, Record: EngineRecord(state, pin),
 			Arguments: args, Sockets: sockets, MemoryLimit: 48 << 30,

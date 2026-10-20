@@ -61,7 +61,10 @@ func describeAccess(p string) (string, error) {
 // folder and that its sibling under the root kept its access.
 func installAdopts(t *testing.T, kind, set string, files func(dir string) []host.VideoModelFile) string {
 	t.Helper()
-	base := t.TempDir()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := filepath.Join(base, "OA-models")
 	from := filepath.Join(root, "set")
 	sibling := filepath.Join(root, "sibling")

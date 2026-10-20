@@ -140,7 +140,7 @@ func TestLivePreloadTokenParity(t *testing.T) {
 	defer engineLog.Close()
 	const name = "live:chat"
 	pin, _ := PinnedEngine(runtime.GOOS, runtime.GOARCH)
-	h, err := New(Options{
+	h, err := newTestHost(Options{
 		Models: []Model{{Name: name, Store: "live", Object: "model"}},
 		Engine: Engine{Program: program, Pin: pin, Record: EngineRecord(state, pin), Arguments: arguments,
 			Sockets: sockets, MemoryLimit: 48 << 30, Ready: 10 * time.Minute, Stderr: engineLog},
@@ -401,7 +401,7 @@ func measurePreload(t *testing.T, engine Engine, model, out string) []preloadSte
 	defer engineLog.Close()
 	engine.Stderr = engineLog
 	const name = "live:chat"
-	h, err := New(Options{
+	h, err := newTestHost(Options{
 		Models: []Model{{Name: name, Store: "live", Object: "model"}},
 		Engine: engine,
 		Source: fakeSource{objects: map[string]Object{"live/model": {Store: "live", ID: "model", Path: model,

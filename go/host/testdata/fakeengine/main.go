@@ -9,6 +9,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,13 +28,24 @@ import (
 
 var heldMemory []byte
 
+// Tests outside package host can choose slow readiness at link time without
+// exposing the host's private fixture arguments to production configuration.
+var defaultLoadTime = "0s"
+
 func main() {
+	initialLoad, initialLoadErr := time.ParseDuration(defaultLoadTime)
+	if initialLoadErr != nil {
+		panic(initialLoadErr)
+	}
 	model := flag.String("model", "", "the model file this engine was told to load")
 	alias := flag.String("alias", "", "the name it answers under")
 	host := flag.String("host", "127.0.0.1", "")
 	port := flag.Int("port", 0, "")
 	embeddings := flag.Bool("embeddings", false, "")
-	load := flag.Duration("fake-load", 0, "how long this engine pretends to be loading")
+	load := flag.Duration("fake-load", initialLoad, "how long this engine pretends to be loading")
+	loadPhases := flag.Bool("fake-load-phases", false, "emit pinned genuine load phase lines while pretending to load")
+	outputLine := flag.String("fake-output", "", "write this line to stdout and stderr")
+	failAfter := flag.Duration("fake-fail-after", 0, "delay a requested failure")
 	alloc := flag.Uint64("fake-alloc", 0, "commit this many bytes before readiness")
 	childPIDFile := flag.String("fake-child-pid-file", "", "write a spawned child's PID here")
 	childMode := flag.Bool("fake-child-mode", false, "wait as a test descendant")
@@ -45,21 +59,42 @@ func main() {
 	completionGate := flag.String("fake-completion-gate", "", "hold each /completion until this file exists")
 	failLine := flag.String("fake-fail-line", "", "print this line to stderr and exit 1 before serving, as a load that failed")
 	flag.Bool("no-webui", false, "")
+	// The vision projector the provider resolves beside the model; like
+	// llama-server, the engine refuses to start when the file is missing.
+	mmproj := flag.String("mmproj", "", "")
 	// The placement options the provider passes by default (MODELHOST-L9)
 	// and a person may give instead.
 	flag.String("n-gpu-layers", "", "")
 	flag.String("load-mode", "", "")
 	flag.Bool("no-mmap", false, "")
 	flag.Bool("mmap", false, "")
-	// Unknown llama-server flags are tolerated the way a real one tolerates
-	// the extra arguments a person configured.
+	// Provider cache bounds are accepted without allocating model state.
+	flag.Int("cache-ram", 0, "")
+	flag.Int("ctx-checkpoints", 0, "")
+	flag.Int("cache-reuse", 0, "")
+	flag.String("slot-prompt-similarity", "", "")
+	flag.Int("parallel", 0, "")
+	ctxSize := flag.Int("ctx-size", 0, "")
+	failAboveContext := flag.Int("fake-fail-above-ctx", 0, "print an allocation failure and exit 1 when --ctx-size exceeds this")
+	flag.String("spec-type", "", "")
+	flag.Int("spec-draft-n-max", 0, "")
+	flag.String("slot-save-path", "", "")
 	flag.CommandLine.Init("fakeengine", flag.ContinueOnError)
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
+	if *failAboveContext > 0 && *ctxSize > *failAboveContext {
+		fmt.Fprintln(os.Stderr, "alloc_tensor_range: failed to allocate Vulkan0 buffer of size 9663676416")
+		os.Exit(1)
+	}
 	if *failLine != "" {
+		time.Sleep(*failAfter)
 		fmt.Fprintln(os.Stderr, *failLine)
 		os.Exit(1)
+	}
+	if *outputLine != "" {
+		fmt.Fprintln(os.Stdout, "stdout: "+*outputLine)
+		fmt.Fprintln(os.Stderr, "stderr: "+*outputLine)
 	}
 	if *childMode {
 		if err := os.WriteFile(*childPIDFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
@@ -119,6 +154,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "fakeengine: %v\n", err)
 		os.Exit(2)
 	}
+	if *mmproj != "" {
+		if _, err := os.Stat(*mmproj); err != nil {
+			fmt.Fprintf(os.Stderr, "fakeengine: %v\n", err)
+			os.Exit(2)
+		}
+	}
 	if *alloc > 0 {
 		heldMemory = make([]byte, int(*alloc))
 		for i := 0; i < len(heldMemory); i += 4096 {
@@ -150,7 +191,17 @@ func main() {
 	if *load <= 0 {
 		ready.Store(true)
 	} else {
-		go func() { time.Sleep(*load); ready.Store(true) }()
+		go func() {
+			if *loadPhases {
+				for _, line := range []string{"llama_model_loader: loaded meta data with 1 key-value pairs", "load_tensors: loading model tensors, this can take a while...", "llama_context: constructing llama_context", "sched_reserve: graph nodes  = 10"} {
+					fmt.Fprintln(os.Stderr, line)
+					time.Sleep(*load / 4)
+				}
+			} else {
+				time.Sleep(*load)
+			}
+			ready.Store(true)
+		}()
 	}
 
 	mux := http.NewServeMux()
@@ -168,14 +219,49 @@ func main() {
 	})
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
+			Model    string `json:"model"`
+			Stream   bool   `json:"stream"`
+			Messages []struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+			// A request naming reasoning_effort is answered as a thinking
+			// llama-server does: no reasoning section when
+			// chat_template_kwargs enable_thinking is false; otherwise one
+			// "think " token per token of reasoning_budget_tokens, then
+			// reasoning_budget_message, then the answer "Paris".
+			ReasoningEffort    *string        `json:"reasoning_effort"`
+			ReasoningBudget    int            `json:"reasoning_budget_tokens"`
+			ReasoningMessage   string         `json:"reasoning_budget_message"`
+			ChatTemplateKwargs map[string]any `json:"chat_template_kwargs"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher, _ := w.(http.Flusher)
 		text := "hosted by " + name
+		// Each image_url data part the engine received is answered with
+		// the SHA-256 of its bytes, so a test sees the image arrive.
+		for _, m := range body.Messages {
+			var parts []struct {
+				Type     string `json:"type"`
+				ImageURL struct {
+					URL string `json:"url"`
+				} `json:"image_url"`
+			}
+			if json.Unmarshal(m.Content, &parts) != nil {
+				continue
+			}
+			for _, part := range parts {
+				_, data, ok := strings.Cut(part.ImageURL.URL, ";base64,")
+				if part.Type != "image_url" || !ok {
+					continue
+				}
+				if raw, err := base64.StdEncoding.DecodeString(data); err == nil {
+					sum := sha256.Sum256(raw)
+					text += " image:sha256:" + hex.EncodeToString(sum[:])
+				}
+			}
+		}
 		chunk := func(v any) {
 			raw, _ := json.Marshal(v)
 			fmt.Fprintf(w, "data: %s\n\n", raw)
@@ -183,9 +269,22 @@ func main() {
 				flusher.Flush()
 			}
 		}
+		generated := 3
+		if body.ReasoningEffort != nil {
+			text, generated = "Paris", 1
+			if on, set := body.ChatTemplateKwargs["enable_thinking"].(bool); !set || on {
+				for range body.ReasoningBudget {
+					chunk(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"reasoning_content": "think "}}}})
+				}
+				if body.ReasoningMessage != "" {
+					chunk(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"reasoning_content": body.ReasoningMessage}}}})
+				}
+				generated += body.ReasoningBudget
+			}
+		}
 		chunk(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": text}}}})
 		chunk(map[string]any{"choices": []map[string]any{{"delta": map[string]any{}, "finish_reason": "stop"}},
-			"usage": map[string]any{"prompt_tokens": 3, "completion_tokens": 3}})
+			"usage": map[string]any{"prompt_tokens": 3, "completion_tokens": generated}})
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		if flusher != nil {
 			flusher.Flush()

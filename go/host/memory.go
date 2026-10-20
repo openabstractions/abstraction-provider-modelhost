@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/modelfiles"
+	"github.com/openabstractions/abstraction-provider-kit/go/modelfiles"
 	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 )
 

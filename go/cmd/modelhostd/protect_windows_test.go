@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/openabstractions/abstraction-identity/go/privatedir"
+	"golang.org/x/sys/windows"
 
 	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
 )
@@ -30,7 +31,10 @@ func junctionAt(t *testing.T, link, target string) {
 // and writes nothing; a home-like root and a junctioned root are refused
 // before anything changes.
 func TestModelsProtectReprotectsSetFolders(t *testing.T) {
-	base := t.TempDir()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := filepath.Join(base, "OA-models")
 	state := filepath.Join(base, "state")
 	video := filepath.Join(root, "video")
@@ -76,7 +80,9 @@ func TestModelsProtectReprotectsSetFolders(t *testing.T) {
 		}
 	}
 
-	home, err := os.UserHomeDir()
+	// The account's home as privatedir names it: the profile known folder,
+	// which stays the account's while the tests' USERPROFILE is a stand-in.
+	home, err := windows.KnownFolderPath(windows.FOLDERID_Profile, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

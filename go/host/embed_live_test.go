@@ -55,7 +55,7 @@ func TestLiveEmbedBGE(t *testing.T) {
 		t.Fatal("no pinned engine for this platform")
 	}
 	var provider *inference.Provider
-	h, err := New(Options{
+	h, err := newTestHost(Options{
 		Models: []Model{{Name: name, Store: "live", Object: "bge"}},
 		Engine: Engine{Program: program, Pin: pin, Record: EngineRecord(state, pin),
 			Arguments:  []string{"--ctx-size", "8192", "--n-gpu-layers", "0", "--parallel", "1", "--ubatch-size", "256", "--no-mmap"},

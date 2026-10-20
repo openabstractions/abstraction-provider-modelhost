@@ -8,7 +8,7 @@ process for each model on this machine and keeps the model loaded while
 calls keep arriving.
 
 **What's new here:** Every application that asks for a model shares one loaded
-copy, held under a lease that other programs asking OA for the card can ask
+copy, held under a [lease](https://openabstractions.github.io/reference.html#concept-resource.lease) that other programs asking OA for the card can ask
 back, and a model nothing has used for its idle time unloads on its own.
 
 It serves chat and embeddings on the pinned `llama.cpp` release and video on
@@ -52,11 +52,19 @@ modelhostd serve --endpoint NAME --engine PATH --model NAME=STORE/OBJECT
                  [--ready DURATION] [--chat-memory-limit BYTES]
                  [--runtime-program PATH]
                  [--config FILE] [--home DIR] [--state DIR] [--verbose]
-modelhostd engine install --archive ZIP [--dir DIR] [--state DIR]
+modelhostd engine install (--bundle ZIP | --archive ZIP) [--dir DIR] [--state DIR]
 modelhostd engine check --engine PATH [--engine-arg ARG]... [--state DIR]
 modelhostd engine unlock [--dir DIR] [--state DIR]
 modelhostd help
 ```
+
+`--endpoint` short names use `[a-z0-9-]+` and resolve through the current
+account's bootstrap namespace. Absolute endpoint paths and full Windows named
+pipes are passed verbatim, including runtime-assigned provider paths. Dots,
+underscores, uppercase letters and spaces formerly passed through the CLI's
+unrestricted short-name interpolation; they now require an explicit path.
+This CLI shortcut restriction does not change registered provider-name grammar.
+
 
 On Windows, `--chat-memory-limit` sets an optional per-process job limit in
 bytes for each llama-server. The service leaves it unset at zero. A model's
@@ -69,10 +77,17 @@ The model host launches one llama.cpp release, pinned in
 b10825 Vulkan: `llama-b10825-bin-win-vulkan-x64.zip`, 35,227,898 bytes,
 SHA-256 `8907e5f3b74cb57d93fd94e187a87d85be24dc64e3b0ff2bc1b287da17b31446`,
 published at
-`https://github.com/ggml-org/llama.cpp/releases/download/b10825/`. Download
-that archive, then run `modelhostd engine install --archive <zip>`. The
-install checks the archive's size and SHA-256, writes the 24 pinned files and
-none of the archive's command-line tools or RPC server, makes the folder
+`https://github.com/ggml-org/llama.cpp/releases/download/b10825/`. The
+publisher builds against the DLL form of the Microsoft Visual C++ runtime,
+which a clean Windows lacks, so the engine folder also holds three pinned
+files of Microsoft's Visual C++ redistributable beside the 24 publisher
+files. They travel in OA's reduced bundle `llama-b10825-oa-win-vulkan-x64.zip`
+(installed at `tools\engines\`, derived by the redist repository's
+`windows/modelhost_engine.py derive`). Run
+`modelhostd engine install --bundle <zip>`; `--archive` with the publisher
+ZIP refuses, naming the missing runtime. The install checks the bundle's size
+and SHA-256, writes the 27 pinned files and none of the publisher's
+command-line tools or RPC server, makes the folder
 read-only for this account and prints the `llama-server.exe` path to pass as
 `--engine`. Before every start the folder is hashed against the pin and held
 unchanged while the engine runs (inference CONTRACT.md INF-F1..INF-F4). Any
@@ -83,7 +98,11 @@ the declaration. `engine unlock` gives a folder this provider recorded back to
 the account for removal, and refuses any other folder. Without `--dir` it
 unlocks the folder the engine record names and does nothing when no record
 exists; the Windows uninstaller runs it that way before it removes
-`modelhostd`.
+`modelhostd`. When OpenAbstractions is installed again, `serve` finds the
+recorded folder without its read-only ACL, hashes every file against the pin
+and sets the ACL again when all of them prove. A file that differs is
+replaced from the bundled engine ZIP; without that ZIP the start is refused
+and names the repair.
 
 The b10825 review approved the build with conditions, and the provider
 enforces conditions 2, 3, 6 and 7 around every start:
@@ -204,13 +223,13 @@ caller from the connection's program proof, decides the rule, and forwards.
 
 `serve`'s `TestLiveHostTheSmallestGGUFUnderALease` (`OA_LIVE_MODELHOST=1`)
 builds this provider and the real `inventoryd`, stages the pinned engine
-with `modelhostd engine install` from the archive `OA_LLAMA_B10825_ZIP`
-names, declares both to an isolated runtime with `--embeddings`, hosts the
+with `modelhostd engine install --bundle` from the reduced ZIP
+`OA_LLAMA_B10825_BUNDLE` names, declares both to an isolated runtime with `--embeddings`, hosts the
 smallest GGUF the composed inventory lists, answers one chat through the
 runtime, answers a second off the same load, answers one `embed@1` call
 straight to this provider's own endpoint off the same load, then asks
 `card:0` for its whole capacity and asserts the lease is gone. Without
-`OA_LLAMA_B10825_ZIP` it skips and names the archive to download.
+`OA_LLAMA_B10825_BUNDLE` it skips and names the bundle to use.
 
 On 2026-09-22, before the pin, hosting `unsloth/SmolLM2-135M-Instruct-GGUF` (88,201,792
 bytes) with an unpinned `llama-server --embeddings --pooling mean`: the first chat call
@@ -446,7 +465,7 @@ there it refuses every engine with a stated reason:
   (MODELHOST-L7, MODELHOST-V5): `engine:network-socket` for a chat engine,
   `engine:listener-not-loopback` for the video engine.
 - **macOS:** `modelhostd serve` stops at startup, because its socket
-  endpoint cannot carry the Program proof it requires of the runtime
+  endpoint cannot carry the [Program](https://openabstractions.github.io/reference.html#concept-identity.listener-program-need) proof it requires of the runtime
   (abstraction-identity `CanEver`). Behind it, no primitive binds an
   engine's server process, on its AF_UNIX socket (ID-T8) or its loopback
   port (`LoopbackCeiling`), so every engine request would fail its peer

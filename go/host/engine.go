@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -12,11 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	identity "github.com/openabstractions/abstraction-identity"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/devicelost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/devicelost"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 	"github.com/openabstractions/abstraction-provider-kit/go/engineproc"
 	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 )
@@ -37,14 +38,15 @@ type Engine struct {
 	Record string
 	// Files proves the engine folder before each start and holds its files
 	// until the engine exits (INF-F1..INF-F4). New makes one when it is nil.
-	Files *enginefiles.Verifier
+	Files *programfiles.Verifier
 	// Arguments are extra arguments a person configured, placed after the
 	// model, host and port this provider chooses. Each must be on the
 	// reviewed list; New refuses any other (EngineArguments, MODELHOST-L5).
 	Arguments []string
 	// Embeddings asks the engine to serve the embeddings endpoint as well.
 	Embeddings bool
-	// Start, ready and stop budgets; zero reads the defaults below.
+	// Ready is the readiness stall budget; first genuine load phases reset it.
+	// Zero reads DefaultReady.
 	Ready time.Duration
 	// MemoryLimit is the engine job's per-process memory limit in bytes on
 	// Windows. Zero leaves the established service default without a cap;
@@ -60,6 +62,9 @@ type Engine struct {
 	// enginelaunch.SocketRoot, whatever the state folder; tests name their
 	// own. A socket path in it must fit enginelaunch.MaxSocketPath.
 	Sockets string
+	// cache is the provider's private launch recipe. Person arguments never
+	// populate it. A nil recipe preserves the engine defaults.
+	cache *engineCache
 
 	// fixture are the stand-in engine's own flags. Only this package's
 	// tests set them; they are never checked against the reviewed list
@@ -78,6 +83,17 @@ type Engine struct {
 	// that printed it; New sets it when the provider has GPU fault handling
 	// (MODELHOST-G1).
 	deviceLost func(p *Process, marker string)
+	loadPhase  func(uint64)
+	// modelPin is supplied by the content-evidence owner for this launch.
+	modelPin    *programfiles.Placed
+	modelRecord string
+	// contextLoad is the context plan this launch runs, nil for a model
+	// without one; the host records it for reloads and the fit fallback.
+	contextLoad *enginePlan
+	// projector is the model's vision projector file the host resolved in
+	// the model's store, passed as --mmproj; empty for none. It is never a
+	// person's argument (EngineArguments refuses --mmproj).
+	projector string
 }
 
 // engineOutput is where an engine's output goes: out, read on the way for
@@ -100,9 +116,8 @@ func (e Engine) socketParent() (string, error) {
 	return enginelaunch.SocketRoot()
 }
 
-// DefaultReady is how long a model has to load before the call that asked for
-// it gives up. A cold read of a multi-gigabyte file off a spinning disk is the
-// case this has to fit.
+// DefaultReady bounds a readiness stall. Genuine first load phases reset it;
+// a phase with no observable progress can still reach this bound.
 const DefaultReady = 180 * time.Second
 
 // accepts is what the pinned engine reads: llama-server at b10825 takes a
@@ -155,8 +170,8 @@ func (e Engine) configured() error {
 }
 
 // tree is the engine folder as enginefiles proves it.
-func (e Engine) tree() enginefiles.Tree {
-	return enginefiles.Tree{Name: "llama.cpp " + e.Pin.Release, Root: filepath.Dir(e.Program),
+func (e Engine) tree() programfiles.Tree {
+	return programfiles.Tree{Name: "llama.cpp " + e.Pin.Release, Root: filepath.Dir(e.Program),
 		Manifest: e.Pin.manifest(), Record: e.Record}
 }
 
@@ -165,7 +180,7 @@ func (e Engine) tree() enginefiles.Tree {
 // engine:unreadable and passes once the file is free; any other refusal
 // means the folder is not the pinned release (engine:none).
 func (e Engine) filesRefusal(err error) *Refusal {
-	if errors.Is(err, enginefiles.ErrUnreadable) {
+	if errors.Is(err, programfiles.ErrUnreadable) {
 		return refuse(EngineUnreadable, "a file of the engine folder %s could not be read (%v); try again once the program holding it lets go",
 			filepath.Dir(e.Program), err)
 	}
@@ -179,9 +194,14 @@ func (e Engine) filesRefusal(err error) *Refusal {
 // contained process tree is confirmed gone. Other platforms retain the
 // direct-child lifecycle.
 type Process struct {
-	owned  *engineproc.Process
-	id     int
-	exited <-chan struct{}
+	cacheSlots      *cacheSlots
+	requestSettings requestSettingsByUse
+	answerReserve   answerReserve
+	loadProgress    *loadProgress
+	log             *engineLog
+	owned           *engineproc.Process
+	id              int
+	exited          <-chan struct{}
 	// contains answers whether a process is in this engine's contained
 	// tree; the Windows job sets it. Without it no socket counts as the
 	// engine's, and the readiness check refuses.
@@ -278,6 +298,7 @@ type leaseGrant struct {
 // pin and held, and the launch directory kept, until the engine's exit is
 // confirmed; an unconfirmed exit keeps both (INF-F4, MODELHOST-L7).
 func (e Engine) start(modelPath, alias string, grant leaseGrant) (*Process, error) {
+	prepareStarted := time.Now()
 	if err := e.configured(); err != nil {
 		return nil, refuse(NoEngine, "%v", err)
 	}
@@ -323,6 +344,27 @@ func (e Engine) start(modelPath, alias string, grant leaseGrant) (*Process, erro
 		reportEndpoint(removeEndpoint())
 		return nil, e.filesRefusal(err)
 	}
+	var modelHold *programfiles.Hold
+	if e.modelPin != nil {
+		placed := *e.modelPin
+		placed.Path = modelPath
+		modelHold, err = e.Files.LaunchPlaced(context.Background(), "GGUF "+alias, []programfiles.Placed{placed}, e.modelRecord)
+		if err != nil {
+			cleanupErr := errors.Join(hold.Release(), removeEndpoint())
+			if plain := placedProblem(err, downloadChatAgain); plain != "" && cleanupErr == nil {
+				return nil, refuse(Unavailable, "%s", plain)
+			}
+			return nil, refuse(Unavailable, "the model file: %v", errors.Join(err, cleanupErr))
+		}
+		modelPath = modelHold.Paths()[0]
+	}
+	release := func() error {
+		var modelErr error
+		if modelHold != nil {
+			modelErr = modelHold.Release()
+		}
+		return errors.Join(hold.Release(), modelErr)
+	}
 	if e.beforeLaunch != nil {
 		e.beforeLaunch(endpoint)
 	}
@@ -336,11 +378,15 @@ func (e Engine) start(modelPath, alias string, grant leaseGrant) (*Process, erro
 	if alias != "" {
 		args = append(args, "--alias", alias)
 	}
+	if e.projector != "" {
+		args = append(args, "--mmproj", e.projector)
+	}
 	if e.Embeddings {
 		args = append(args, "--embeddings")
 	}
 	args = append(args, enginePlacement(grant.resource, grant.size, extra)...)
 	args = append(args, extra...)
+	args = append(args, e.cacheRecipe().arguments()...)
 	args = append(args, e.fixture...)
 	var started *Process
 	client, err := enginehttp.NewUnixClient(endpoint.Socket, func(server identity.Process) (bool, error) {
@@ -352,26 +398,56 @@ func (e Engine) start(modelPath, alias string, grant leaseGrant) (*Process, erro
 	if err != nil {
 		endpointErr := removeEndpoint()
 		reportEndpoint(endpointErr)
-		cleanupErr := errors.Join(hold.Release(), endpointErr)
+		cleanupErr := errors.Join(release(), endpointErr)
 		return nil, refuse(Unavailable, "the engine client: %v", errors.Join(err, cleanupErr))
 	}
-	fit := newFitTap(e.Stderr)
-	output, lost := engineOutput(fit, devicelost.LlamaServer, e.deviceLost)
 	model := alias
 	if model == "" {
 		model = filepath.Base(modelPath)
 	}
+	// Each model keeps bounded output in provider state across restarts.
+	// The hash is a filename, never a model path supplied by the caller.
+	logID := sha256.Sum256([]byte(model))
+	log, err := openEngineLog(filepath.Join(filepath.Dir(e.Record), "logs", fmt.Sprintf("llama-%x.log", logID[:8])), engineLogBytes)
+	if err != nil {
+		cleanupErr := errors.Join(release(), removeEndpoint())
+		return nil, refuse(Unavailable, "the engine log: %v", errors.Join(err, cleanupErr))
+	}
+	// Arguments include effective placement and the pinned model locator;
+	// the launch key remains in the environment and is never logged.
+	_, logErr := fmt.Fprintf(log, "%s phase=launch prepare_ms=%d release=%q model=%q args=%q\n", time.Now().UTC().Format(time.RFC3339Nano), time.Since(prepareStarted).Milliseconds(), e.Pin.Release, model, args)
+	if logErr != nil {
+		cleanupErr := errors.Join(log.Close(), release(), removeEndpoint())
+		return nil, refuse(Unavailable, "the engine log: %v", errors.Join(logErr, cleanupErr))
+	}
+	var outputWriter io.Writer = log
+	if e.Stderr != nil {
+		outputWriter = io.MultiWriter(log, e.Stderr)
+	}
+	progress := &loadProgress{out: outputWriter, publish: e.loadPhase}
+	fit := newFitTap(progress)
+	output, lost := engineOutput(fit, devicelost.LlamaServer, e.deviceLost)
 	p, err := startOwnedProcess(ownedSpec{Program: e.Program, Args: args, Env: env, Output: output,
 		MemoryLimit: e.MemoryLimit,
 		Engine:      "llama-server", Model: model, Exited: e.exited})
 	if err != nil {
+		if closeErr := log.Close(); closeErr != nil && e.report != nil {
+			e.report(closeErr)
+		}
 		//unchecked: the start failure is the error returned; a failed close leaves only read-shared handles
-		hold.Release()
+		release()
 		reportEndpoint(removeEndpoint())
 		return nil, err
 	}
 	started = p
+	// A model file this launch hashed in full is in the file cache already
+	// (MODELHOST-L10).
+	if modelHold == nil || modelHold.Hashed() == 0 {
+		startWarming([]string{modelPath}, p.exited, log)
+	}
+	p.log = log
 	p.fit = fit
+	p.loadProgress = progress
 	p.endpoint = endpoint
 	p.key = key
 	p.client = client
@@ -380,7 +456,8 @@ func (e Engine) start(modelPath, alias string, grant leaseGrant) (*Process, erro
 	go func() {
 		<-p.exited
 		defer close(cleaned)
-		p.cleanupErr = errors.Join(hold.Release(), removeEndpoint())
+		_, logErr := fmt.Fprintf(log, "%s phase=exit elapsed_ms=%d\n", time.Now().UTC().Format(time.RFC3339Nano), time.Since(prepareStarted).Milliseconds())
+		p.cleanupErr = errors.Join(release(), removeEndpoint(), logErr, log.Close())
 		p.reportCleanup(p.cleanupErr, e.report)
 	}()
 	lost.Bind(p)

@@ -8,8 +8,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/llamacpp"
+	inference "github.com/openabstractions/abstraction-inference/go"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/llamacpp"
 )
 
 // ErrEngineMedia reports an engine request that carries media the engine
@@ -111,6 +112,33 @@ func (g mediaGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return g.refuse(req, err)
 	}
+	var release func(bool)
+	prefill := false
+	cut := ""
+	if h, ok := g.engines.(*Host); ok && req.Method == http.MethodPost && req.URL != nil {
+		raw, release, err = h.prepareCacheRequest(req.Context(), req.URL.Host, req.URL.Path, raw)
+		if err != nil {
+			return nil, err
+		}
+		if req.URL.Path == "/v1/chat/completions" {
+			cut = cutReasoningMessage(raw)
+		}
+		if req.URL.Path == "/v1/chat/completions" && req.Context().Value(warmRequest{}) == nil {
+			raw, prefill, err = requestPrefillProgress(raw)
+			if err != nil {
+				if release != nil {
+					release(false)
+				}
+				return nil, err
+			}
+		}
+	}
+	// Transfer ownership to the response body only after transport succeeds.
+	defer func() {
+		if release != nil {
+			release(false)
+		}
+	}()
 	// Every request that runs work leaves this process here: it marks the
 	// engine used and cancels a preload in flight it does not continue
 	// (MODELHOST-W3). The preload's own requests are not counted.
@@ -131,7 +159,20 @@ func (g mediaGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	out.Body = io.NopCloser(bytes.NewReader(raw))
 	out.ContentLength = int64(len(raw))
 	out.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(raw)), nil }
-	return g.next.RoundTrip(g.keyed(out, req))
+	response, err := g.next.RoundTrip(g.keyed(out, req))
+	if err == nil && response != nil && release != nil {
+		response.Body = &cacheResponseBody{ReadCloser: response.Body, release: release, complete: response.StatusCode >= 200 && response.StatusCode < 300, ctx: req.Context()}
+		release = nil
+	}
+	if err == nil && response != nil && response.StatusCode == http.StatusOK && prefill {
+		response.Body = &prefillProgressBody{ReadCloser: response.Body, report: func(processed, total int64) bool {
+			return inference.ReportExecutionPrefill(req.Context(), processed, total)
+		}}
+	}
+	if err == nil && response != nil && response.StatusCode == http.StatusOK && cut != "" {
+		response.Body = newReasoningCutBody(response.Body, cut)
+	}
+	return response, err
 }
 
 // keyed sets the per-launch key of the engine at req's host on out, the

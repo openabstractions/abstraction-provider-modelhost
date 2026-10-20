@@ -5,13 +5,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/openabstractions/abstraction-facade/go/supervision"
+	"github.com/openabstractions/abstraction-provider-kit/go/llamacpp"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/llamacpp"
 )
 
 // ErrEngineEnvironment reports an engine environment entry outside the
@@ -48,7 +47,7 @@ var engineSystemNames = []string{"USERPROFILE", "LOCALAPPDATA", "APPDATA", "Prog
 
 // registryString reads the profile registry for the builder; tests replace
 // it to model a profile whose folders name other variables.
-var registryString enginelaunch.RegistryValue = enginelaunch.SystemRegistry
+var registryString supervision.RegistryValue = supervision.SystemRegistry
 
 // engineEnvironment builds the engine environment from nothing through the
 // provider kit's clean-environment builder, with PATH of System32 alone, and
@@ -60,7 +59,7 @@ var registryString enginelaunch.RegistryValue = enginelaunch.SystemRegistry
 // without a check. Elsewhere PATH and TMPDIR are the whole environment.
 func engineEnvironment(temp string) ([]string, []error, error) {
 	var omitted []error
-	env, err := enginelaunch.CleanEnvironment{Temp: temp, Names: engineSystemNames, Registry: registryString,
+	env, err := supervision.CleanEnvironment{Temp: temp, Names: engineSystemNames, Registry: registryString,
 		OnError: func(err error) { omitted = append(omitted, err) }}.Build()
 	if err != nil {
 		return nil, nil, err

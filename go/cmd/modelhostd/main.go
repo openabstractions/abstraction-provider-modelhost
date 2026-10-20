@@ -13,23 +13,32 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	timestampwire "github.com/openabstractions/abstraction-job/go/rec"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/openabstractions/abstraction-identity/listen"
+	configclient "github.com/openabstractions/abstraction-config/go/client"
+	"github.com/openabstractions/abstraction-facade/go-core/bootstrap"
+	registration "github.com/openabstractions/abstraction-facade/go/abstraction/facade/registration"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	inference "github.com/openabstractions/abstraction-inference/go"
-	"github.com/openabstractions/abstraction-inference/go/providerhost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	modelwire "github.com/openabstractions/abstraction-model/go/abstraction/model/api"
+	modelservice "github.com/openabstractions/abstraction-model/go/service"
+	"github.com/openabstractions/abstraction-provider-kit/go/providerhost"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	resource "github.com/openabstractions/abstraction-resource/go/client"
-	router "github.com/openabstractions/abstraction-router/go"
+	"github.com/openabstractions/abstraction-storage/go/digest"
+	"github.com/openabstractions/abstraction-storage/go/layout"
 
 	"github.com/openabstractions/abstraction-provider-kit/go/runtimeprog"
+	"github.com/openabstractions/abstraction-provider-modelhost/go/declaration"
 	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
 	"github.com/openabstractions/abstraction-provider-modelhost/go/service"
 )
@@ -42,8 +51,9 @@ when nothing has used the model for the idle time, the engine is stopped and
 the lease released.
 
 The daemon downloads nothing. --engine names the llama-server of the one
-llama.cpp release this provider launches, staged by 'modelhostd engine install'
-from the reduced ZIP in the OA package or from the publisher's reviewed ZIP.
+llama.cpp release this provider launches, staged by 'modelhostd engine install
+--bundle' from the reduced ZIP in the OA package. The publisher's ZIP lacks
+the Microsoft Visual C++ runtime the engine needs, so --archive refuses it.
 Before each start the engine folder is hashed against the pin and held
 unchanged while the engine runs. Without --engine, when the path names no
 file, and when the folder differs from the pin in any file, every call is
@@ -53,7 +63,8 @@ The pinned release on Windows x64 is llama.cpp b10825, Vulkan:
   archive  llama-b10825-bin-win-vulkan-x64.zip, 35227898 bytes
   SHA-256  8907e5f3b74cb57d93fd94e187a87d85be24dc64e3b0ff2bc1b287da17b31446
   from     https://github.com/ggml-org/llama.cpp/releases/download/b10825/
-  bundle   reduced ZIP with exactly the reviewed runtime files; see
+  bundle   reduced ZIP with exactly the reviewed files of that archive and
+           3 app-local Microsoft Visual C++ runtime files; see
            modelhostd engine pin --json for its name, size and SHA-256
 No other platform has a reviewed release; there every call is refused.
 
@@ -69,6 +80,9 @@ pinned stable-diffusion.cpp sd-server and one reviewed video model set
            ASUS's AICreator store keeps it, with the same encoder and
            decoder, under the AMD Responsible AI Use Policy
            (research/security-reviews/hummingbird-xt-i2v-files.md);
+           ltx-2.5: LTX-2.5 (video with sound), its Q8_0 transformer,
+           Q8_0 Gemma 4 encoder, video and audio VAEs and x2 latent
+           upscaler, under the LTX-2 Community License;
            each read where 'modelhostd models install' found it
 sd-server has no authentication: while it runs, any local process that
 finds its loopback port can use it (README "Video").
@@ -78,8 +92,12 @@ The OA PyTorch engine is its own provider, pytorchd; --video-kind torch,
 --kind torch are refused with its name.
 
 Usage:
+  modelhostd declare <serve options>
+                  emit the typed registration document for these arguments;
+                  reads no engine or model and starts no provider
   modelhostd serve --endpoint NAME --engine PATH --model NAME=STORE/OBJECT
                    [--model NAME=STORE/OBJECT]... [--resource-endpoint PATH]
+                   [--model-content STORE/OBJECT=sha256:HEX:BYTES]...
                    [--resource NAME] [--engine-arg ARG]... [--embeddings]
                    [--idle DURATION] [--wait DURATION]
                    [--ready DURATION] [--chat-memory-limit BYTES]
@@ -108,10 +126,12 @@ Commands:
                   --embeddings, on the identity-bound local endpoint NAME, for
                   the designated runtime program, until interrupted
   engine pin      print the versioned JSON pin for Setup and package derivation
-  engine install  check the publisher ZIP (--archive) or the reduced OA package
-                  ZIP (--bundle) against its own pinned size and SHA-256, write
-                  exactly the pinned files into DIR (absent or empty;
-                  default <user cache>\OpenAbstractions\engines\llama.cpp-
+  engine install  check the reduced OA package ZIP (--bundle; llama.cpp) or the
+                  publisher ZIP (--archive; --kind sdcpp) against its own
+                  pinned size and SHA-256, write
+                  exactly the pinned files into DIR (restaging an earlier pin;
+                  default <state>\engines\llama.cpp-<release> with --state,
+                  else <account data>\OpenAbstractions\engines\llama.cpp-
                   <release>), make DIR read-only for this account and print
                   the llama-server path to pass as --engine
   engine check    prove PATH's folder against the pin as a call would;
@@ -130,7 +150,7 @@ Commands:
                   lies, held read-only while it runs. A file that this
                   account or the machine's administrators alone can change
                   (a --from folder) or the machine's alone (a store) is
-                  hashed in full once per provider process; any other at
+                  hashed in full once and then proved by its record; any other at
                   every launch
   models check    prove the recorded files where they lie, as a video call
                   would
@@ -164,8 +184,11 @@ Standby no new load starts. While a video runs it holds the wake lease. It
 never changes the Windows TDR settings (resource CONTRACT.md RES-G7).
 
 Options:
+  Endpoint shortcuts use [a-z0-9-]+. Absolute paths and full named pipes are
+  used verbatim. Other short spellings (dot, underscore, uppercase, spaces)
+  are no longer shortcuts; use the runtime-assigned explicit endpoint path.
   --endpoint NAME          local endpoint name; the platform endpoint is
-                           \\.\pipe\openabstractions-NAME on Windows and a
+                           \\.\pipe\openabstractions-user-<SID>-NAME on Windows and a
                            socket in a per-account directory elsewhere
   --runtime-program P      absolute runtime executable permitted to call;
                            repeat to name both runtime forms on Windows;
@@ -211,16 +234,21 @@ Options:
                            llama-server, in bytes; 0 leaves it unset
   --config FILE            the store configuration
                            abstraction-storage-over-local-stores reads, JSON;
-                           default $INVENTORYD_CONFIG
+                           default $INVENTORYD_CONFIG. serve takes it more
+                           than once and reads every store each one names;
+                           any --config replaces $INVENTORYD_CONFIG, which
+                           is then not read
   --home DIR               read this directory as the user's home
   --state DIR              this provider's private state, where the engine
                            folder's metadata record lives; default
-                           <user cache>\OpenAbstractions\providers\modelhost.
+                           <account data>\OpenAbstractions\providers\modelhost.
                            Engine sockets live under %LOCALAPPDATA%\oa\s on
                            Windows, $XDG_RUNTIME_DIR/oa or /tmp/oa-<uid> on
                            Linux and $TMPDIR/oa on macOS, whatever --state is
   --verbose                write the engine's own output to stderr
-  --archive ZIP            engine install: the publisher's reviewed archive
+  --archive ZIP            engine install --kind sdcpp: the publisher's reviewed
+                           archive; llama.cpp refuses it (it lacks the Visual
+                           C++ runtime the engine needs; use --bundle)
   --bundle ZIP             engine install: OA's reviewed-files-only package ZIP
   --json                   engine pin: machine-readable pin (schema 1)
   --dir DIR                engine install, engine unlock: the engine folder
@@ -228,8 +256,8 @@ Options:
                            for engine) or sdcpp (the video engine and its
                            model set)
   --set SET                models: the reviewed video model set,
-                           fastwan2.2-ti2v-5b (the default) or
-                           hummingbird-xt-i2v
+                           fastwan2.2-ti2v-5b (the default),
+                           hummingbird-xt-i2v or ltx-2.5
   --from DIR               models install: a folder that may hold the set's
                            files, such as the one a person downloaded them to;
                            repeatable. A set folder under the models root
@@ -239,7 +267,8 @@ Options:
                            folder per set; default <home>\OA-models
   --job-store DIR          models: the runtime's job store, whose results may
                            share a file with a set folder; default
-                           %LOCALAPPDATA%\openabstractions\runtime-v1\jobs
+                           %LOCALAPPDATA%\openabstractions\runtime-v1\jobs.
+                           An empty value is refused
   --dry-run                models protect: report each recorded set folder
                            and write nothing
   --video-model SET        serve: also serve abstraction.inference/video@1 for
@@ -289,6 +318,8 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 		return 0
 	case "serve":
 		return runServe(args[1:], stdout, stderr, getenv)
+	case "declare":
+		return runServeMode(args[1:], stdout, stderr, getenv, true)
 	case "engine":
 		return runEngine(args[1:], stdout, stderr)
 	case "models":
@@ -318,6 +349,49 @@ func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
 
 // parseModel reads one allowlist entry, NAME=STORE/OBJECT. The object is named
 // the way the storage inventory names it and never by path.
+func applyModelContents(models []host.Model, values []string) error {
+	fit := modelservice.FitCatalog(context.Background(), modelwire.CatalogUseCode, modelservice.CatalogSources{
+		Pool:   func(context.Context) (int64, error) { return 0, nil },
+		Served: func(context.Context, string) ([]modelservice.ServedFamily, error) { return nil, nil },
+	})
+	seen := map[string]bool{}
+	for _, value := range values {
+		object, pin, ok := strings.Cut(value, "=")
+		parts := strings.Split(pin, ":")
+		if !ok || seen[object] || len(parts) != 3 || parts[0] != "sha256" {
+			return fmt.Errorf("--model-content takes each STORE/OBJECT=sha256:hex:bytes once")
+		}
+		if !digest.Valid(parts[0] + ":" + parts[1]) {
+			return fmt.Errorf("--model-content requires a canonical SHA-256 digest")
+		}
+		size, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || size <= 0 || strconv.FormatInt(size, 10) != parts[2] {
+			return fmt.Errorf("--model-content requires a positive canonical size")
+		}
+		matches := 0
+		for _, entry := range fit.Entries {
+			if entry.Digest == "sha256:"+parts[1] && entry.DownloadBytes == size {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return fmt.Errorf("--model-content digest and size do not name one reviewed catalogue entry")
+		}
+		bound := false
+		for i := range models {
+			if models[i].Store+"/"+models[i].Object == object {
+				models[i].Content = &programfiles.File{Size: size, SHA256: parts[1]}
+				bound = true
+			}
+		}
+		if !bound {
+			return fmt.Errorf("--model-content names no --model object")
+		}
+		seen[object] = true
+	}
+	return nil
+}
+
 func parseModel(entry string) (host.Model, error) {
 	name, object, ok := strings.Cut(entry, "=")
 	if !ok || name == "" || object == "" {
@@ -331,6 +405,10 @@ func parseModel(entry string) (host.Model, error) {
 }
 
 func runServe(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
+	return runServeMode(args, stdout, stderr, getenv, false)
+}
+
+func runServeMode(args []string, stdout, stderr io.Writer, getenv func(string) string, declare bool) int {
 	if wantsHelp(args) {
 		if _, err := io.WriteString(stdout, usage); err != nil {
 			return 1
@@ -352,12 +430,14 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	wait := fs.Duration("wait", host.DefaultWait, "")
 	ready := fs.Duration("ready", host.DefaultReady, "")
 	chatMemory := fs.Uint64("chat-memory-limit", 0, "")
-	config := fs.String("config", getenv("INVENTORYD_CONFIG"), "")
+	var configs repeated
+	fs.Var(&configs, "config", "")
 	home := fs.String("home", "", "")
 	stateDir := fs.String("state", "", "")
 	verbose := fs.Bool("verbose", false, "")
-	var models, engineArgs, videoArgs repeated
+	var models, modelContents, engineArgs, videoArgs repeated
 	fs.Var(&models, "model", "")
+	fs.Var(&modelContents, "model-content", "")
 	fs.Var(&engineArgs, "engine-arg", "")
 	videoModel := fs.String("video-model", "", "")
 	videoEngine := fs.String("video-engine", getenv("MODELHOST_VIDEO_ENGINE"), "")
@@ -398,9 +478,49 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		fmt.Fprintf(stderr, "modelhostd serve: --video-kind is sdcpp, not %q\n", *videoKind)
 		return 2
 	}
+	allowed := make([]host.Model, 0, len(models))
+	for _, entry := range models {
+		m, err := parseModel(entry)
+		if err != nil {
+			fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
+			return 2
+		}
+		allowed = append(allowed, m)
+	}
+	if err := applyModelContents(allowed, modelContents); err != nil {
+		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
+		return 2
+	}
+	if declare {
+		var declarationErr error
+		declarationArgs := append([]string{}, args...)
+		engineGiven := false
+		fs.Visit(func(f *flag.Flag) { engineGiven = engineGiven || f.Name == "engine" })
+		if !engineGiven && *engine != "" {
+			declarationArgs = append(declarationArgs, "--engine", *engine)
+		}
+		if _, declarationErr = sdcpp.ParseArgs(videoArgs); declarationErr == nil {
+			_, declarationErr = host.EngineArguments(engineArgs)
+		}
+		if declarationErr == nil {
+			declarationErr = writeServeDeclaration(stdout, declarationArgs, *endpoint, *engine, *embeddings, *resourceName, models, *videoModel)
+		}
+		if declarationErr != nil {
+			//unchecked: declaration failure is carried by the exit status
+			fmt.Fprintf(stderr, "modelhostd declare: %v\n", declarationErr)
+			return 2
+		}
+		return 0
+	}
 	if *endpoint == "" {
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
 		fmt.Fprint(stderr, "modelhostd serve: --endpoint is required\n\n"+usage)
+		return 2
+	}
+	address, err := serveEndpoint(*endpoint)
+	if err != nil {
+		//unchecked: stderr failure cannot change this pre-provider refusal
+		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
 		return 2
 	}
 	if len(models) == 0 && *videoModel == "" {
@@ -424,18 +544,10 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
 		return 2
 	}
-	allowed := make([]host.Model, 0, len(models))
-	for _, entry := range models {
-		m, err := parseModel(entry)
-		if err != nil {
-			//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
-			fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
-			return 2
-		}
-		allowed = append(allowed, m)
+	if len(configs) == 0 {
+		configs = repeated{getenv("INVENTORYD_CONFIG")}
 	}
-
-	cfg, err := host.LoadConfig(*config)
+	cfg, err := host.LoadConfigs(configs)
 	if err != nil {
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
 		fmt.Fprintf(stderr, "modelhostd serve: configuration: %v\n", err)
@@ -459,6 +571,31 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	}
 	//unchecked: a platform with no pinned release leaves pin zero, and every call is refused engine:none
 	pin, _ := host.PinnedEngine(runtime.GOOS, runtime.GOARCH)
+	engineCheck := service.EngineCheck{Kind: service.EngineCheckKind, Copy: pin.Release, State: service.EngineUnverified,
+		Reason: "engine:unobserved", Checked: timestampwire.FormatTimestamp(time.Now())}
+	if len(allowed) > 0 && pin.Bundle.Name != "" {
+		self, err := os.Executable()
+		if err == nil {
+			dir, cacheErr := layout.DefaultEngineDir("llama.cpp", pin.Release)
+			if cacheErr == nil {
+				cacheErr = layout.EnsureNoBackup(filepath.Dir(dir))
+			}
+			if cacheErr == nil {
+				var status int
+				engineCheck, status = prepareServeStartup(context.Background(), pin, *engine, state, self, dir, programfiles.NewVerifier(programfiles.Options{}), stderr)
+				if status != 0 {
+					return status
+				}
+			} else {
+				err = cacheErr
+			}
+		}
+		if err != nil {
+			//unchecked: startup failure is reported by the exit status
+			fmt.Fprintf(stderr, "modelhostd serve: prepare bundled engine: %v\n", err)
+			return 1
+		}
+	}
 
 	leaseEndpoint := *resourceEndpoint
 	if leaseEndpoint == "" {
@@ -468,8 +605,11 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		//unchecked: callback has no return path; a failed diagnostic cannot turn a failed model action into success
 		fmt.Fprintf(stderr, "modelhostd: %v\n", err)
 	}
+	handler, closeDiagnostics := resolvedDiagnostics("modelhostd")
+	defer closeDiagnostics()
+	logger := slog.New(handler)
 	leases := resource.New(leaseEndpoint)
-	gpu, err := newGPUGuard(state, leases, stderr, report)
+	gpu, err := newGPUGuard(state, leases, stderr, report, logger)
 	if err != nil {
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
 		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
@@ -485,16 +625,19 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	// MODELHOST-H6). keep only runs from model.Run, called well after provider is
 	// assigned, so the nil check below never actually fires in this binary.
 	var provider *inference.Provider
+	// The model host reads and watches model_context as OA's own provider,
+	// under its registration's config key (decision D, 2026-11-08).
+	settings := configclient.Discover()
 	var video *host.VideoOptions
-	var content *providerhost.DesignatedContent
-	if *videoModel != "" {
-		content, err = providerhost.NewDesignatedContent("modelhost-video", filepath.Join(state, "content"),
-			filepath.Join(state, "content-uploads.json"), programs, videoInputLimit)
-		if err != nil {
-			//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
-			fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
-			return 1
-		}
+	// One content store serves this endpoint: the runtime stages chat input
+	// images and video first frames in it, and reads video results from it
+	// (CONTRACT.md MODELHOST-L12, MODELHOST-V9).
+	content, err := providerhost.NewDesignatedContent("modelhost-content", filepath.Join(state, "content"),
+		filepath.Join(state, "content-uploads.json"), programs, contentInputLimit)
+	if err != nil {
+		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
+		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
+		return 1
 	}
 	if *videoModel != "" {
 		videoPin, _ := host.PinnedVideoEngine(runtime.GOOS, runtime.GOARCH)
@@ -519,51 +662,55 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		Resource: *resourceName,
 		Idle:     *idle,
 		Wait:     *wait,
+		// Each curated model load reads this machine's memory pool and the
+		// person's chosen context through the runtime's own services.
+		Capacity:      machineCapacity(leases, *resourceName),
+		ContextChoice: contextChoice(settings, report),
 		Active: func(name string) bool {
 			if provider == nil {
 				return false
 			}
 			return provider.ActiveForModel(name)
 		},
+		// A yield waits only for requests in flight, never for a reply kept
+		// for observation, and new requests wait behind it (resource RES-L3).
+		InFlight: func(name string) int {
+			if provider == nil {
+				return 0
+			}
+			return provider.InFlightForModel(name)
+		},
 		OnError:      report,
-		OnEngineExit: engineExitReport(stderr),
+		OnEngineExit: engineExitReport(stderr, logger),
 		Video:        video,
 	})
 	if err != nil {
-		if content != nil {
-			//unchecked: the construction failure is reported below
-			content.Component.Close()
-		}
+		//unchecked: the construction failure is reported below
+		content.Component.Close()
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
 		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
 		return 2
 	}
 	defer model.Close()
+	// The engine hosts declare each model's facts, read from its files
+	// before the router is built; a read still running after the bound
+	// completes in the background and reaches Describe (MODELHOST-L12).
+	factsCtx, factsDone := context.WithTimeout(context.Background(), factsReadBound)
+	model.RefreshFacts(factsCtx)
+	factsDone()
 
-	// Each resident's engine is its own OpenAI-compatible host, reached at the
-	// one address this provider reserved for it: asking the engine would mean
-	// starting it, so the router is told the address up front, one entry per
-	// allowlist name, never a shared one two engine processes could collide
-	// on (CONTRACT.md MODELHOST-H5). Embed is only declared when this engine kind
-	// was started with embeddings, so a request for it without --embeddings
-	// reads no_host instead of an upstream failure.
-	profiles := []string{router.ProfileChat}
-	if *embeddings {
-		profiles = append(profiles, router.ProfileEmbed)
-	}
-	r := router.New()
-	engineHosts := make([]*router.Host, 0, len(model.Models()))
-	for _, name := range model.Models() {
-		engineHost := router.OpenAICompatible("modelhost-engine-"+name, model.Base(name), "/v1", []string{name})
-		engineHost.Profiles = profiles
-		engineHosts = append(engineHosts, engineHost)
-	}
-	r.SetHosts(engineHosts...)
+	// One engine host per allowlist name at its reserved address; embed only
+	// with --embeddings (CONTRACT.md MODELHOST-H5).
+	r := service.Routes(model, *embeddings)
 	// Admit loads model's object after preflight and before execution; a load
 	// that cannot happen is this provider's own refusal word (CONTRACT.md
 	// MODELHOST-H2). Every engine request passes the media guard
 	// (MODELHOST-L8).
 	providerConfig := service.ProviderConfig(model, r, report)
+	providerConfig.Record = cacheObservationRecord(logger)
+	// Chat input images the runtime staged in the content store reach the
+	// engine as image_url data (MODELHOST-L12).
+	providerConfig.ResolveContent = content.ResolveContent
 	provider, err = inference.New(providerConfig)
 	if err != nil {
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
@@ -572,17 +719,24 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	}
 	defer provider.Close()
 
-	served, err := service.Listen(listen.Endpoint(*endpoint), provider, programs...)
+	served, err := service.Listen(address, provider, programs...)
 	if err != nil {
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
 		fmt.Fprintf(stderr, "modelhostd serve: %v\n", err)
 		return 1
 	}
-	if content != nil {
-		// video@1 and the content store the runtime stages first frames in
-		// and reads results from share this endpoint (CONTRACT.md
-		// MODELHOST-V9).
-		served.Content = content.Component
+	served.ProducerChecks = service.EngineChecks(engineCheck)
+	// Describe names the loaded models, which the runtime's router reads as
+	// this host's residency (MODELHOST-H10).
+	served.Residents = model.Residents
+	served.ResidentContexts = model.LoadedContexts
+	// The chat@3 description states each model's capabilities, which the
+	// runtime's router reads as the aliases' (MODELHOST-L12).
+	served.ModelCapabilities = service.ModelCapabilities(model)
+	// The content store the runtime stages chat images and first frames in,
+	// and video@1, share this endpoint (CONTRACT.md MODELHOST-V9).
+	served.Content = content.Component
+	if *videoModel != "" {
 		served.Video = model.VideoServer()
 	}
 	served.OnError = func(err error) {
@@ -593,8 +747,12 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	defer stop()
 	done := make(chan struct{})
 	go func() { defer close(done); model.Run(ctx) }()
-	go gpu.Run(ctx)
-	defer gpu.Flush()
+	contextDone := make(chan struct{})
+	go func() { defer close(contextDone); watchModelContext(ctx, settings, model.ContextChanged, report) }()
+	defer func() { stop(); <-contextDone }()
+	gpuDone := make(chan struct{})
+	go func() { defer close(gpuDone); gpu.Run(ctx) }()
+	defer func() { stop(); <-gpuDone; gpu.Flush() }()
 	bases := make([]string, 0, len(model.Models())+1)
 	for _, name := range model.Models() {
 		bases = append(bases, name+"@"+model.Base(name))
@@ -604,7 +762,7 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	}
 	//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
 	fmt.Fprintf(stdout, "modelhostd serving abstraction.inference/chat@1 on %s; engines at %s\n",
-		listen.Endpoint(*endpoint), strings.Join(bases, ", "))
+		address, strings.Join(bases, ", "))
 	err = served.Serve(ctx)
 	stop()
 	//unchecked: shutdown path; model.Close was already deferred above (idempotent), this just runs it before the wait below rather than at function exit
@@ -619,6 +777,75 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		return 1
 	}
 	return 0
+}
+
+// prepareServeStartup owns the preparation observation and its CLI exit policy.
+// It runs before provider construction, listening or engine execution.
+func prepareServeStartup(ctx context.Context, pin host.EnginePin, program, state, self, dir string, files *programfiles.Verifier, stderr io.Writer) (service.EngineCheck, int) {
+	check, err := prepareServeEngineObserved(ctx, pin, program, state, self, dir, files, stderr)
+	if err != nil {
+		//unchecked: startup failure is reported by the exit status
+		fmt.Fprintf(stderr, "modelhostd serve: prepare bundled engine: %v\n", err)
+		return check, 1
+	}
+	return check, 0
+}
+
+// writeServeDeclaration reports configured producer facts through the same
+// generated registration document accepted by the runtime. It reads no engine,
+// model, configuration or installation state.
+func writeServeDeclaration(out io.Writer, args []string, endpoint, engine string, embeddings bool, resource string, entries []string, video string) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			if refusal, ok := value.(*registration.Refusal); ok {
+				err = refusal
+				return
+			}
+			panic(value)
+		}
+	}()
+	if endpoint == "" || len(entries) == 0 && video == "" {
+		return fmt.Errorf("--endpoint and at least one --model or --video-model are required")
+	}
+	facet := registration.ProviderFacet{Name: declaration.ProviderName, Arguments: append([]string{"serve"}, args...), Endpoint: endpoint,
+		Activation: registration.ActivationOnDemand, Resources: []string{resource}}
+	var models []declaration.Model
+	if len(entries) > 0 {
+		// declaration.Build names model_context for a chat facet.
+		facet.Services = append(facet.Services, inference.Contract, inference.PreloadContract)
+		if embeddings {
+			facet.Services = append(facet.Services, "abstraction.inference/embed@1")
+		}
+	}
+	for _, entry := range entries {
+		model, parseErr := parseModel(entry)
+		if parseErr != nil {
+			return parseErr
+		}
+		models = append(models, declaration.Model{Name: model.Name, Store: model.Store, Object: model.Object})
+		facet.Models = append(facet.Models, registration.ScopedModel{Modality: "chat", Model: model.Name})
+		if embeddings {
+			facet.Models = append(facet.Models, registration.ScopedModel{Modality: "embed", Model: model.Name})
+		}
+	}
+	if video != "" {
+		facet.Services = append(facet.Services, "abstraction.inference/video@1")
+		facet.Models = append(facet.Models, registration.ScopedModel{Modality: "video", Model: video})
+	}
+	program, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	spec, err := declaration.Build(program, facet, engine, models)
+	if err != nil {
+		return err
+	}
+	encoded := registration.EncodeRegistrationSpec(&spec)
+	n, err := out.Write(encoded)
+	if err == nil && n != len(encoded) {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 func userHome(getenv func(string) string) string {
@@ -645,7 +872,7 @@ func runtimeProgramsAt(self string, configured []string) ([]string, error) {
 }
 
 // stateFolder is this provider's private state: dir when it is given, or
-// <user cache>/OpenAbstractions/providers/modelhost. It is made when absent.
+// <account data>/OpenAbstractions/providers/modelhost (layout.AccountData). It is made when absent.
 func stateFolder(dir string) (string, error) {
 	dir, err := statePath(dir)
 	if err != nil {
@@ -660,11 +887,11 @@ func stateFolder(dir string) (string, error) {
 // statePath is the state folder stateFolder names, without making it.
 func statePath(dir string) (string, error) {
 	if dir == "" {
-		cache, err := os.UserCacheDir()
+		providers, err := layout.DefaultProviderStateRoot()
 		if err != nil {
 			return "", fmt.Errorf("no state folder; pass --state: %w", err)
 		}
-		dir = filepath.Join(cache, "OpenAbstractions", "providers", "modelhost")
+		dir = filepath.Join(providers, "modelhost")
 	}
 	if !filepath.IsAbs(dir) {
 		return "", fmt.Errorf("--state %s is not an absolute path", dir)
@@ -752,17 +979,29 @@ func runEngine(args []string, stdout, stderr io.Writer) int {
 		if (*archive == "") == (*bundle == "") {
 			return fail(2, "give one of --archive (publisher ZIP) or --bundle (reduced OA package ZIP)")
 		}
-		target := *dir
-		if target == "" {
-			cache, err := os.UserCacheDir()
-			if err != nil {
-				return fail(2, "no default engine folder; pass --dir: %v", err)
-			}
-			target = filepath.Join(cache, "OpenAbstractions", "engines", "llama.cpp-"+pin.Release)
+		if *archive != "" && pin.CarriesRuntime() {
+			return fail(1, "--archive cannot stage llama.cpp %s: the publisher's ZIP lacks the %s the engine needs; give --bundle with the engine ZIP OpenAbstractions installs in tools\\engines", pin.Release, pin.Runtime.Name)
 		}
 		state, err := stateFolder(*stateDir)
 		if err != nil {
 			return fail(2, "%v", err)
+		}
+		target := *dir
+		switch {
+		case target != "":
+		case *stateDir != "":
+			// A named state folder keeps its own engine, so an isolated
+			// runtime's model host never shares the installed one's.
+			target = filepath.Join(state, "engines", "llama.cpp-"+pin.Release)
+		default:
+			var err error
+			target, err = layout.DefaultEngineDir("llama.cpp", pin.Release)
+			if err != nil {
+				return fail(2, "no default engine folder; pass --dir: %v", err)
+			}
+			if err := layout.EnsureNoBackup(filepath.Dir(target)); err != nil {
+				return fail(2, "the engines folder: %v", err)
+			}
 		}
 		input := *archive
 		if *bundle != "" {
@@ -776,7 +1015,7 @@ func runEngine(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fail(2, "%v", err)
 		}
-		verifier := enginefiles.NewVerifier(enginefiles.Options{})
+		verifier := programfiles.NewVerifier(programfiles.Options{})
 		var program string
 		if *bundle != "" {
 			program, err = host.InstallBundledEngine(context.Background(), verifier,
@@ -840,7 +1079,7 @@ func runEngine(args []string, stdout, stderr io.Writer) int {
 		// UnlockWithin also reaches the subfolders a killed unlock left
 		// read-only, and a recorded folder already removed has nothing to
 		// give back.
-		if err := enginefiles.UnlockWithin(target); err != nil {
+		if err := programfiles.UnlockWithin(target); err != nil {
 			return fail(1, "%v", err)
 		}
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
@@ -849,3 +1088,20 @@ func runEngine(args []string, stdout, stderr io.Writer) int {
 	}
 	return fail(2, "unknown command; see modelhostd help")
 }
+
+// serveEndpoint routes CLI input only; bootstrap owns account placement.
+func serveEndpoint(value string) (string, error) {
+	windowsDrive := len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
+	if filepath.IsAbs(value) || strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\\`) || windowsDrive {
+		return value, nil
+	}
+	address, err := bootstrap.Endpoint(value)
+	if err != nil {
+		return "", fmt.Errorf("resolve short endpoint (names use [a-z0-9-]+; use an explicit absolute endpoint path for other names): %w", err)
+	}
+	return address, nil
+}
+
+// factsReadBound is how long start waits for the models' facts before the
+// router is built.
+const factsReadBound = 10 * time.Second

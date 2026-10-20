@@ -4,7 +4,7 @@ import (
 	"time"
 
 	identity "github.com/openabstractions/abstraction-identity"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 	"github.com/openabstractions/abstraction-provider-kit/go/refusal"
 )
 

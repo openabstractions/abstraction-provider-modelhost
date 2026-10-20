@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	identity "github.com/openabstractions/abstraction-identity"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	infwire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
 	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	"github.com/openabstractions/abstraction-resource/go/holder"
@@ -135,8 +135,8 @@ func engineProgram(t *testing.T) string {
 // their temporary folders.
 type openACL struct{}
 
-func (openACL) Restrict([]string) error                 { return nil }
-func (openACL) Check(string, *enginefiles.Handle) error { return nil }
+func (openACL) Restrict([]string) error                  { return nil }
+func (openACL) Check(string, *programfiles.Handle) error { return nil }
 
 // fakePin pins the stand-in engine's folder, which holds the program alone.
 func fakePin(t *testing.T, program string) EnginePin {
@@ -147,7 +147,7 @@ func fakePin(t *testing.T, program string) EnginePin {
 	}
 	sum := sha256.Sum256(raw)
 	return EnginePin{Release: "test", Program: filepath.Base(program),
-		Files: []enginefiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
+		Files: []programfiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
 }
 
 // pinnedEngine is the stand-in engine under its own pin, proven by a
@@ -157,9 +157,12 @@ func pinnedEngine(t *testing.T) Engine {
 	t.Helper()
 	program := engineProgram(t)
 	return Engine{Program: program, Pin: fakePin(t, program), Ready: 30 * time.Second,
+		// Unrelated holder tests isolate weight bytes with an explicit inert
+		// recipe. Profile tests clear this to exercise production selection.
+		cache:   &engineCache{},
 		Record:  filepath.Join(t.TempDir(), "engine.files"),
 		Sockets: socketFolder(t),
-		Files:   enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})}
+		Files:   programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})}
 }
 
 // socketFolder is a socket root not yet made, in a short folder of the
@@ -314,6 +317,10 @@ func (f *fakeLeases) Renew(lease string) (res.LeaseChange, error) {
 	return res.LeaseChange{Applied: f.live[lease]}, nil
 }
 
+func (*fakeLeases) Label(string, string) (res.LeaseChange, error) {
+	return res.LeaseChange{Applied: true}, nil
+}
+
 func (f *fakeLeases) Release(lease string) (res.LeaseChange, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -371,7 +378,7 @@ func composed(t *testing.T, leases *fakeLeases, adjust func(*Options)) *Host {
 	if adjust != nil {
 		adjust(&options)
 	}
-	h, err := New(options)
+	h, err := newTestHost(options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +411,7 @@ func composedTwo(t *testing.T, leases *fakeLeases, adjust func(*Options)) *Host 
 	if adjust != nil {
 		adjust(&options)
 	}
-	h, err := New(options)
+	h, err := newTestHost(options)
 	if err != nil {
 		t.Fatal(err)
 	}

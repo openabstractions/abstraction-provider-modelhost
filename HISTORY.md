@@ -560,3 +560,23 @@ MODELHOST-E1 is the kit's KIT-P3, which this provider still cites for its
 engines. `modelhostd` refuses the PyTorch kind's options with the new
 provider's name, and `openabstractions models host` declares that provider.
 
+## 0.8.0 contract truth pass (W0-04), 2026-10-21
+
+Each changed or reviewed statement with its class: an outdated rule is text the code has passed, a code defect is code or IDL that breaks a rule and becomes a TODO row, an accepted divergence is recorded under Divergences.
+
+| statement | class | action |
+| --- | --- | --- |
+| Not built: writes into no other directory, yet links modelbridge | outdated rule | names the `bridge` seam it links and the kit owner (D8) |
+
+## Persisted prompt cache, 2026-11-04
+
+The owner directed "make these features great" for the chat cache on
+2026-11-03. The architect's "Chat cache design", Layer 3, gives the model
+host one bounded cache of its own: provider-set slot files in a private
+directory, keyed by account, app and chat binding, sealed in encrypted
+envelopes, no-backup, size-bounded and cleared by the person. A
+person-supplied `--slot-save-path` stays refused.
+
+| id | before | now |
+| --- | --- | --- |
+| MODELHOST-W1 | binding: the prefix is the `Preload` call's; nothing kept or learned; per engine only whether it was used and the preload in flight | binding: the prefix is the `Preload` call's; nothing learned from chat requests; the one thing kept is the persisted prompt cache, written only by the provider to its private directory; per engine only whether it was used and the preload in flight |

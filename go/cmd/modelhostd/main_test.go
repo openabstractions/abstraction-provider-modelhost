@@ -2,17 +2,61 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/openabstractions/abstraction-facade/go-core/bootstrap"
+	"github.com/openabstractions/abstraction-identity/listen"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	"github.com/openabstractions/abstraction-identity"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-identity/go/privatedir/privatetest"
 	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
+	"github.com/openabstractions/abstraction-provider-modelhost/go/service"
 )
+
+func TestServeStartupKeepsUnprovenMissingEngineVisible(t *testing.T) {
+	for _, variant := range []string{"missing-record", "foreign-record"} {
+		t.Run(variant, func(t *testing.T) {
+			parent, state := t.TempDir(), t.TempDir()
+			dir := filepath.Join(parent, "managed")
+			pin := host.EnginePin{Release: "inert", Program: "llama-server.exe"}
+			var recordBytes []byte
+			record := host.EngineRecord(state, pin)
+			if variant == "foreign-record" {
+				recordBytes = []byte("root\t" + filepath.Join(t.TempDir(), "foreign") + "\n")
+				if err := os.WriteFile(record, recordBytes, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var diagnostics bytes.Buffer
+			check, status := prepareServeStartup(t.Context(), pin, filepath.Join(dir, pin.Program), state, filepath.Join(t.TempDir(), "modelhostd.exe"), dir, programfiles.NewVerifier(programfiles.Options{}), &diagnostics)
+			if status != 0 || check.State != service.EngineUnverified || check.Reason != "engine:custom_path" || diagnostics.Len() != 0 {
+				t.Fatalf("startup status %d, check %#v, diagnostics %q", status, check, diagnostics.String())
+			}
+			if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unproven missing target changed: %v", err)
+			}
+			got, err := os.ReadFile(record)
+			if recordBytes == nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("missing record changed: %v", err)
+				}
+			} else if err != nil || !bytes.Equal(got, recordBytes) {
+				t.Fatalf("foreign record changed: %v", err)
+			}
+		})
+	}
+}
 
 type failedWriter struct{}
 
@@ -35,7 +79,9 @@ func TestEngineInstallRefusesAnUnpinnedArchive(t *testing.T) {
 	var out, errs bytes.Buffer
 	status := run([]string{"engine", "install", "--archive", archive, "--dir", dir, "--state", t.TempDir()},
 		&out, &errs, func(string) string { return "" })
-	want := "is not the pinned llama-b10825-bin-win-vulkan-x64.zip"
+	// The reviewed pin carries an app-local Visual C++ runtime the publisher's
+	// ZIP lacks, so the publisher-archive route refuses before reading it.
+	want := "--archive cannot stage llama.cpp b10825: the publisher's ZIP lacks the Microsoft Visual C++"
 	if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
 		want = "no reviewed llama.cpp release is pinned"
 	}
@@ -147,15 +193,15 @@ func TestEngineUnlockWithoutDirUnlocksTheRecordedFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	if runtime.GOOS == "windows" {
-		sid, err := enginefiles.AccountSID()
+		sid, err := programfiles.AccountSID()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := enginefiles.SetFolderACL(dir, sid, enginefiles.ReadOnly); err != nil {
+		if err := programfiles.SetFolderACL(dir, sid, programfiles.ReadOnly); err != nil {
 			t.Fatal(err)
 		}
 		//unchecked: cleanup of a folder the test may already have removed
-		t.Cleanup(func() { _ = enginefiles.UnlockWithin(dir) })
+		t.Cleanup(func() { _ = programfiles.UnlockWithin(dir) })
 	}
 	out.Reset()
 	errs.Reset()
@@ -182,11 +228,21 @@ func TestEngineCheckRefusesAnUnpinnedEngine(t *testing.T) {
 	}
 }
 
+var fixtureEndpointSequence atomic.Int64
+
+func explicitFixtureEndpoint(t *testing.T, name string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`\\.\pipe\oa-test-%s-%d-%d`, name, os.Getpid(), fixtureEndpointSequence.Add(1))
+	}
+	return filepath.Join(privatetest.SocketDir(t), name+".sock")
+}
+
 // serve and engine check refuse an engine argument outside the reviewed list
 // by name, before anything starts (MODELHOST-L5).
 func TestEngineArgumentOutsideTheListIsRefusedByName(t *testing.T) {
 	commands := map[string][]string{
-		"serve": {"serve", "--endpoint", "modelhost-arg-test", "--model", "tiny=fake/tiny",
+		"serve": {"serve", "--endpoint", explicitFixtureEndpoint(t, "modelhost-arg-test"), "--model", "tiny=fake/tiny",
 			"--engine-arg", "--rpc", "--engine-arg", "10.0.0.2:50052"},
 		"engine check": {"engine", "check", "--engine", filepath.Join(t.TempDir(), "llama-server.exe"),
 			"--state", t.TempDir(), "--engine-arg", "--rpc", "--engine-arg", "10.0.0.2:50052"},
@@ -231,5 +287,109 @@ func TestRuntimeDesignationComesFromProviderInstallation(t *testing.T) {
 	programs, err = runtimeProgramsAt(filepath.Join(dir, "modelhostd"), []string{explicit})
 	if err != nil || len(programs) != 1 || programs[0] != identity.CanonicalProgramPath(explicit) {
 		t.Fatalf("explicit program = %v, %v", programs, err)
+	}
+}
+
+// Naming is exercised through a real owned socket/pipe; no provider engine runs.
+func TestLeafEndpointNamingAndReceiving(t *testing.T) {
+	parent, err := os.MkdirTemp("", "st5-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(parent); err != nil {
+			t.Error(err)
+		}
+	})
+	if runtime.GOOS != "windows" {
+		t.Setenv("TMPDIR", parent)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	name := fmt.Sprintf("st5-leaf-%d", os.Getpid())
+	if address, err := serveEndpoint(name); address != "" || !errors.Is(err, bootstrap.ErrNoTrustedInstallation) {
+		t.Fatalf("default name escaped test refusal: %q %v", address, err)
+	}
+	address := filepath.Join(parent, name+".sock")
+	if runtime.GOOS == "windows" {
+		address = `\\.\pipe\oa-test-` + name
+	}
+
+	if actual, err := serveEndpoint(address); err != nil || actual != address {
+		t.Fatalf("explicit address changed: %q %v", actual, err)
+	}
+	for _, explicit := range []string{`/owned/path with spaces/name.sock`, `C:\owned\path with spaces\name.sock`, `\\.\pipe\owned.Name_test`} {
+		if actual, err := serveEndpoint(explicit); err != nil || actual != explicit {
+			t.Fatalf("explicit %q changed to %q: %v", explicit, actual, err)
+		}
+	}
+	listener, err := listen.Listen(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stopListener := context.AfterFunc(ctx, func() { listener.Close() })
+	defer stopListener()
+	answered := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			answered <- err
+			return
+		}
+		defer conn.Close()
+		stop := context.AfterFunc(ctx, func() { conn.Close() })
+		defer stop()
+		var request [1]byte
+		if _, err = io.ReadFull(conn, request[:]); err == nil {
+			if request[0] != 'q' {
+				err = fmt.Errorf("unexpected request %q", request[0])
+			} else {
+				_, err = conn.Write([]byte{'r'})
+			}
+		}
+		answered <- err
+	}()
+	conn, err := listen.Dial(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stopConn := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopConn()
+	if _, err = conn.Write([]byte{'q'}); err != nil {
+		t.Fatal(err)
+	}
+	var reply [1]byte
+	if _, err = io.ReadFull(conn, reply[:]); err != nil || reply[0] != 'r' {
+		t.Fatalf("reply %q: %v", reply, err)
+	}
+	if err := <-answered; err != nil {
+		t.Fatal(err)
+	}
+}
+func TestLeafEndpointRefusesBeforeProviderWork(t *testing.T) {
+	for _, name := range []string{"model.v1", "model_v1", "Model", "model name"} {
+		var output, diagnostics bytes.Buffer
+		code := run([]string{"serve", "--endpoint", name}, &output, &diagnostics, func(string) string { return "" })
+		if code != 2 || !strings.Contains(diagnostics.String(), "[a-z0-9-]+") || !strings.Contains(diagnostics.String(), "explicit absolute endpoint path") || output.Len() != 0 {
+			t.Fatalf("%q: code %d, output %q, diagnostics %q", name, code, output.String(), diagnostics.String())
+		}
+	}
+	if runtime.GOOS != "windows" {
+		// A short name resolves in the runtime directory below; test binaries
+		// need the opt-in to resolve installed endpoints at all.
+		t.Setenv("OA_TEST_ALLOW_INSTALLED_RUNTIME", "1")
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("XDG_RUNTIME_DIR", dir)
+		var output, diagnostics bytes.Buffer
+		code := run([]string{"serve", "--endpoint", "leaf-v1"}, &output, &diagnostics, func(string) string { return "" })
+		if code != 2 || !strings.Contains(diagnostics.String(), "private") || output.Len() != 0 {
+			t.Fatalf("namespace: code %d, output %q, diagnostics %q", code, output.String(), diagnostics.String())
+		}
 	}
 }

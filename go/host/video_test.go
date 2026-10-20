@@ -13,6 +13,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -24,14 +25,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	"github.com/openabstractions/abstraction-identity/go/trustedpath"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 	storage "github.com/openabstractions/abstraction-storage/go"
 )
+
+func TestVideoTransportDiagnosticIsInformationalAndPinned(t *testing.T) {
+	var log, output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	e := VideoEngine{Pin: SdCppMaster843WindowsVulkan}
+	e.logTransport(&output)
+	for _, want := range []string{`"level":"INFO"`, `"engine":"sd-server"`, e.Pin.Release, `"transport":"tcp-loopback"`, "IPC not implemented in this adopter"} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("missing %q: %s", want, log.String())
+		}
+	}
+	if !strings.Contains(output.String(), e.Pin.Release) {
+		t.Fatal(output.String())
+	}
+}
 
 // fakeSDServer builds the stand-in sd-server once per test binary.
 var fakeSDServer = sync.OnceValues(func() (string, error) {
@@ -62,7 +80,7 @@ type videoFixture struct {
 	store    *storage.ContentStore
 	dir      string
 	requests string
-	files    *enginefiles.Verifier
+	files    *programfiles.Verifier
 	// placed is where each model file lies, by name.
 	placed map[string]string
 }
@@ -152,10 +170,10 @@ func newVideoFixture(t *testing.T, fixture ...string) *videoFixture {
 	}
 	sum := sha256.Sum256(raw)
 	pin := EnginePin{Release: "test", Program: filepath.Base(program),
-		Files: []enginefiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
+		Files: []programfiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
 	set, searches := testModelSet(t, root)
-	state := filepath.Join(root, "state")
-	files := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	state := testRecordState(t, root)
+	files := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	placed, err := PlaceVideoModels(context.Background(), set, searches, VideoModelPlaces(state, set))
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +202,7 @@ func (f *videoFixture) host(t *testing.T, leases *fakeLeases, adjust func(*Optio
 	if adjust != nil {
 		adjust(&options)
 	}
-	h, err := New(options)
+	h, err := newTestHost(options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,7 +849,7 @@ func TestVideoEngineArgumentsAreTheReviewedList(t *testing.T) {
 	requireEnginePeer(t)
 	f := newVideoFixture(t)
 	for _, args := range [][]string{{"--lora-model-dir", "x"}, {"-M", "vid_gen"}, {"--listen-ip", "0.0.0.0"}, {"--rpc-servers=h:1"}, {"--steps", "50"}} {
-		_, err := New(Options{Leases: newFakeLeases(), Source: fakeSource{},
+		_, err := newTestHost(Options{Leases: newFakeLeases(), Source: fakeSource{},
 			Video: &VideoOptions{Model: testVideoModel, Engine: VideoEngine{Arguments: args}, Store: f.store}})
 		if !errors.Is(err, sdcpp.ErrForbiddenFlag) && !errors.Is(err, sdcpp.ErrArgument) {
 			t.Fatalf("%q: %v", args, err)
@@ -929,7 +947,7 @@ func TestPlaceVideoModelsBindsInPlace(t *testing.T) {
 		}
 	}
 	held := VideoEngine{Set: set, Places: places, ModelRecord: filepath.Join(root, "state", "models.files")}
-	if err := CheckVideoModels(context.Background(), enginefiles.NewVerifier(enginefiles.Options{}), set, places, held.ModelRecord); err != nil {
+	if err := CheckVideoModels(context.Background(), programfiles.NewVerifier(programfiles.Options{}), set, places, held.ModelRecord); err != nil {
 		t.Fatal(err)
 	}
 	args, err := held.arguments(41000, recorded)
@@ -1177,7 +1195,7 @@ func TestVideoRequestsAreHeldToTheModelSet(t *testing.T) {
 	if acquires, _, _ := leases.counts(); acquires != 0 {
 		t.Fatal("a refused request reached the engine")
 	}
-	if _, err := New(Options{Leases: newFakeLeases(), Source: fakeSource{},
+	if _, err := newTestHost(Options{Leases: newFakeLeases(), Source: fakeSource{},
 		Video: &VideoOptions{Model: "another-model", Engine: f.engine, Store: f.store}}); err == nil {
 		t.Fatal("a video model other than its set's was accepted")
 	}
@@ -1263,7 +1281,7 @@ func TestPlacedModelOwnersReachTheTrustCheck(t *testing.T) {
 	f := newVideoFixture(t)
 	var mu sync.Mutex
 	asked := map[string]trustedpath.Owners{}
-	files := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}, TrustPlaced: func(p string, o trustedpath.Owners) error {
+	files := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}, TrustPlaced: func(p string, o trustedpath.Owners) error {
 		mu.Lock()
 		defer mu.Unlock()
 		asked[p] = o
@@ -1307,5 +1325,31 @@ func TestPlacedModelOwnersReachTheTrustCheck(t *testing.T) {
 	}
 	if _, err := readPlaces(f.engine.Places, f.engine.Set); err == nil {
 		t.Fatal("a record without owners was read")
+	}
+}
+
+// A video remains queued while its engine loads (INF-G6).
+func TestVideoObservationIsQueuedWhileTheEngineLoads(t *testing.T) {
+	f := newVideoFixture(t, "--fake-load=60s")
+	h := f.host(t, newFakeLeases(), nil)
+	op := startVideo(t, h, videoRequest("job-loading"))
+	deadline := time.Now().Add(30 * time.Second)
+	for !h.videoAlive() {
+		if time.Now().After(deadline) {
+			t.Fatal("the loading engine did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if observed := h.VideoServer().Observe(t.Context(), testCaller, op); observed.Status != wire.VideoStateQueued {
+		t.Fatalf("a loading video is %+v", observed)
+	}
+	if cancelled := h.VideoServer().Cancel(t.Context(), testCaller, op); cancelled.Outcome != wire.CancelOutcomeCancelled {
+		t.Fatalf("cancel %+v", cancelled)
+	}
+	if !awaitUnloaded(h) {
+		t.Fatal("the loading engine kept running")
+	}
+	if ended := h.VideoServer().Observe(t.Context(), testCaller, op); ended.Status != wire.VideoStateCancelled {
+		t.Fatalf("cancelled video is %+v", ended)
 	}
 }

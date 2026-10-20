@@ -13,7 +13,7 @@ RES-L1 to RES-L4 the lease this provider holds.
 
 Binds: none (records only)
 
-The service loads each model under a lease, serves it for as long as calls
+The service loads each model under a [lease](https://openabstractions.github.io/reference.html#concept-resource.lease), serves it for as long as calls
 arrive, and stops the engine and releases the lease when the resource is
 asked for or the idle time passes. It serves three things on two engine
 kinds:
@@ -29,14 +29,19 @@ to every kind.
 `modelhostd` ships in the Windows installer's optional `ModelHost` feature,
 off by default, and a person configures it with `openabstractions models
 host`. The llama.cpp and stable-diffusion.cpp kinds run the publishers'
-pinned builds, which `modelhostd engine install` stages from archives the
-person downloads. The OA PyTorch engine, which the model host carried
+pinned builds. `modelhostd engine install --bundle` stages llama.cpp from
+OA's reduced bundle, which the Windows package carries with the app-local
+Visual C++ runtime the build needs; `modelhostd engine install --kind
+sdcpp --archive` stages stable-diffusion.cpp from the archive the person
+downloads. The OA PyTorch engine, which the model host carried
 until 2026-10-02, is its own provider, `abstraction-provider-pytorch`
 (VISION 2026-10-02, "OA may supply an engine process"); its rules moved there
 as PYTORCH-T1..T11, and `modelhostd` refuses its options with that
 provider's name. The model host wraps engines the machine has.
 
 ## Reading this page
+
+The conventions every OA contract carries are stated once in [CONVENTIONS.md](https://github.com/openabstractions/abstractions/blob/main/idl/CONVENTIONS.md); a rule here that applies one cites its `CONV-` id.
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this
@@ -85,17 +90,37 @@ object the source refuses as a PyTorch pickle, which OA never loads, is
 `unavailable` with reason `object:pickle:<store>/<id>`, refused before any
 lease as well (modelbridge CONTRACT.md MODELBRIDGE-L20).
 
+An explicit `Model.Content` pin MUST be retained per allowlist object. The
+additive `--model-content STORE/OBJECT=sha256:<hex>:<bytes>` `modelhostd` argument
+MUST name an existing `--model` binding exactly once and match one compiled
+coding catalogue entry's digest and size; otherwise the command exits 2.
+A pinned source-size mismatch MUST refuse before lease acquisition. Launch
+MUST use `programfiles.LaunchPlaced` to verify the retained expected bytes,
+open the held final path and keep the file and its ancestors through confirmed
+engine exit. Its record is keyed by store/object and its trusted owners are
+the existing folder-search owners. A mismatch refuses before launch and never
+creates a replacement pin from current bytes. Explicit pins apply to every source,
+including embeddings. Missing Content retains the existing unverified
+file launch; `ContentProof`, a store name and source settings supply none.
+
 **[MODELHOST-L2] The allowlist is exhaustive.** A model the declaration does
 not name MUST NOT be loaded, whatever the engine could open. The router
 lists exactly those names as the model server's models, so a hosted model
 is visible before anything is running and no survey starts an engine to
-find out what it holds (facade CONTRACT.md FAC-R2).
+find out what it holds (facade CONTRACT.md FAC-R2). The runtime writes the
+allowlist from the storage inventory: every chat GGUF a store on this
+machine holds, one entry per family, named by its descriptor family, beside
+what a person or Setup hosted; a model a person removed stays out until it
+is hosted again. Writing it never starts an engine.
 
 **[MODELHOST-L3] The engine is a configured path of the pinned release.**
 `--engine` names the `llama-server` of the one llama.cpp release this
 provider pins (VISION 2026-10-01). On Windows x64 the pin is b10825 Vulkan:
-the publisher archive's size and SHA-256, and the size and SHA-256 of each
-of the 24 files the engine folder holds (`go/host/pin.go`). Before every
+the publisher archive's size and SHA-256, the reduced bundle's size and
+SHA-256, and the size and SHA-256 of each of the 27 files the engine folder
+holds: 24 from the publisher archive and 3 of the Microsoft Visual C++
+runtime the publisher's build links to, deployed app-locally
+(`go/host/pin.go`). Before every
 start the provider proves the folder against the pin with the inference
 provider kit (inference CONTRACT.md INF-F1..INF-F4) and holds its files
 until the engine's exit is confirmed. This layer ships no llama.cpp build,
@@ -106,9 +131,12 @@ from the pin in any file, and a platform with no pinned release are all
 (`research/model-bridge/DECISION.md` §4 rule 6). A folder with a file the
 provider cannot open or read, such as one a scanner holds, is `unavailable`
 with reason `engine:unreadable` and the system error, also before any
-lease; it passes once the file is free (inference CONTRACT.md INF-F1). `modelhostd engine install`
-stages the pinned files from the publisher's archive after checking its
-size and SHA-256.
+lease; it passes once the file is free (inference CONTRACT.md INF-F1). `modelhostd engine install
+--bundle` stages the pinned files from the reduced bundle after checking its
+size and SHA-256, and restages a folder staged from an earlier pin. A pin
+that carries runtime files stages from the reduced bundle alone:
+`--archive` refuses in one sentence naming the missing runtime and the
+bundle to give instead.
 
 **[MODELHOST-L4] The engine process is this provider's own.** The service
 MUST start it with the model and the socket path this provider chose
@@ -143,6 +171,17 @@ provider sets itself (`--model`, `--host`, `--alias`, `--embeddings`,
 `New` returns the error. The condition 2 list is the provider kit's
 (abstraction-inference CONTRACT.md INF-LC1), refused before the reviewed
 list is read, and the reviewed list admits none of its spellings.
+
+For each chat launch the provider MAY fill unset arguments from its curated
+model rule, using model's pure `FitCatalog` metadata. It MUST require current
+`hashed` evidence for the exact source object, matching the catalogue digest
+and size. The optional concrete source `ContentProof` capability rechecks the
+existing recorded digest's live file stamp; an earlier source or missing,
+stale, named or mismatched evidence keeps the configured arguments. The
+provider copies the Engine and argument slice per launch, and explicit
+operator flags win. The catalogue supplies the context; the provider's
+reviewed Qwen3.6 35B MTP rule supplies `draft-mtp` with draft length three.
+These defaults MUST NOT become global arguments for other hosted models.
 
 **[MODELHOST-L6] The engine environment is built from nothing.** The
 engine MUST start with no inherited variable; the provider kit's
@@ -266,8 +305,10 @@ directly is refused;
 **[MODELHOST-L9] The engine's placement follows its lease.** The provider
 MUST derive a `llama-server` engine's default placement from the resource
 of the lease it starts under and from nothing specific to the machine. The
-lease admits the file's size alone, as an admission estimate (MODELHOST-H1):
-it covers no KV cache and no compute buffer. Where the resource has a pool,
+lease admits the file's size plus the provider cache recipe's explicit RAM
+and checkpoint forecast, as an admission estimate (MODELHOST-H1). Placement
+uses the file size alone. It covers no other KV cache or compute buffer.
+Where the resource has a pool,
 a file larger than what can be freed reads `lease:insufficient` or
 `lease:holders_refused` before any engine starts (resource RES-L2,
 MODELHOST-H2). On a machine with no pool the acquire never reads
@@ -302,6 +343,56 @@ A person's own `--n-gpu-layers` replaces the layer default, and their own
 whatever spelling they used (MODELHOST-L5). The placement holds for every
 backend the provider pins; today that is Windows x64 Vulkan alone
 (MODELHOST-L3).
+
+**[MODELHOST-L10] The provider warms the model files while the engine
+starts.** Once an engine is running, the provider SHOULD read the model
+files that launch's proof did not read in full into the operating system's
+file cache, with parallel reads, in the order the engine loads them: for
+`sd-server` the text encoder, then the diffusion model, then the decoders.
+It reads nothing when the files together exceed half of the physical memory
+the system reports available, or when that amount is unknown. Warming stops
+when the engine exits. A read error ends it early. It never fails or delays
+a launch, and the engine log gets one `phase=warm` line with the bytes read
+and the time taken, or the reason nothing was read. Warming touches the
+held files read-only and changes no byte the proof covers.
+
+**[MODELHOST-L11] The provider re-checks its model files monthly and names
+a failing file plainly.** Every 10 minutes, while no model loads, no video
+engine runs and the session has had no input for 10 minutes, the provider
+re-hashes the files of each record (each engine tree's, the video set's and
+each pinned chat model's) last fully hashed more than 30 days ago
+(INF-F2, INF-F7). It stops
+as soon as any of those conditions ends and never holds the proof's lock
+while it reads. A file whose bytes no longer match writes one line, and its
+next load is refused. A proof that fails because another program holds a
+model file open for writing reads "the model file X is still being written
+by another program; try again once it finishes". A file that no longer
+matches reads "the model file X no longer matches its download" with how to
+download it again from the archive or the internet. The proof's handles,
+opened with read sharing only, stay open until the engine's exit is
+confirmed, which covers the engine's own open of each file. Once per start
+the provider writes one line when its state folder proves no record across
+starts, with the reason, and one line for each app container or capability
+SID (`S-1-15-*`) that may change a folder above its state folder.
+
+**[MODELHOST-L12] A model's projector loads with it, and its files state
+its capabilities.** When the model's store holds a vision projector for the
+model (bridge `Projectors`: a projector entry in the model's own manifest,
+else a projector beside its weights file whose projection width matches the
+model or whose name carries its family), the provider MUST start the engine
+with `--mmproj` naming that file and MUST count its size in the lease.
+`--mmproj` stays off the reviewed argument list (MODELHOST-L5). The
+endpoint's chat@3 description MUST state each allowlisted chat model's
+capabilities (router `CapabilityFacts`) from cached reads that never wait on
+a file: text input and output; image input with a projector, and audio
+input when that projector's header states `clip.has_audio_encoder`; tools
+when the GGUF chat template formats tools; and, for a template with a
+thinking section whose family profile has reasoning budgets, the llama.cpp
+reasoning control and the `llama.cpp/enable_thinking` and
+`llama.cpp/reasoning_budget` extensions. A fact the files do not state is
+omitted. The endpoint's content store takes the chat input images the
+runtime stages before relaying a chat@3 turn, and the inference provider
+resolves the request's image digests from it.
 
 ## What it serves as video
 
@@ -358,12 +449,16 @@ file with a name outside the models root and the job store is changed; a
 file whose second name lies in the job store is the same file. A job store
 that exists must pass `privatedir.CheckModelsRoot` as the models root does,
 so a drive root, the home or a linked folder given as `--job-store` is
-refused.
+refused. The job store defaults to the runtime's own
+(`modelplace.OwnedRoots`); an empty `--job-store` is refused.
 
 **[MODELHOST-V3] Engine arguments are the reviewed list.** The provider
 builds the command line itself (INF-SD4): `--listen-ip 127.0.0.1`, the port
-it chose, and `--diffusion-model`, `--t5xxl` and `--tae` naming the placed
-files (MODELHOST-V2). The model set's own reviewed switches follow: FastWan 2.2 TI2V 5B
+it chose, and `--diffusion-model`, `--t5xxl` and `--tae` naming a Wan set's
+placed files, or `--diffusion-model`, `--llm`, `--vae`, `--audio-vae` and
+`--hires-upscalers-dir` (the folder holding the placed upscaler) for an LTX
+set (MODELHOST-V2). LTX-2.5 runs with `--diffusion-fa`, `--vae-tiling` and
+`--temporal-tiling`. The model set's own reviewed switches follow: FastWan 2.2 TI2V 5B
 runs with `--diffusion-fa` and `--vae-tiling`, without which its largest
 size ran the device out of memory (research/live-runs/2026-10-01.md).
 `--video-engine-arg` admits only the reviewed device, memory and
@@ -406,8 +501,15 @@ at the rate, and a first frame is optional. Hummingbird-XT image to video
 runs 3 `lcm` steps at guidance 1 on AMD's sigma table (1, 0.967742,
 0.909091, 0, sent as `custom_sigmas`), at 16 fps, 512×512, as WebM; a
 caller's size is 512×512, its duration at most 81 frames at 16 fps, and a
-first frame is required. Every set takes a prompt of at most 2,048 bytes. Frames are the duration times the rate rounded up and
-aligned to 4n+1. Beyond these `Start` answers `unsupported_feature` with
+first frame is required. LTX-2.5 (`ltx-2.5`, video with sound) runs 8 Euler
+steps at guidance 1 on Lightricks' distilled sigma table with flow shift
+2.37, at 24 fps, as WebM with its audio track: 512×512 for size `auto` (the
+quick preset), and 1280×704 in two stages (the quality preset: 640×352,
+the latent upscaled x2, 3 refine steps on the stage-2 table); its duration
+is at most 121 frames at 24 fps aligned to 8n+1, and it takes no first
+frame. Its lease asks for the measured peak of 53 GiB, and its engine's
+memory limit is raised to 64 GiB. Every set takes a prompt of at most 2,048 bytes. Frames are the duration times the rate rounded up and
+aligned to 4n+1 (8n+1 for LTX-2.5). Beyond these `Start` answers `unsupported_feature` with
 reason `size:engine-bound` or `video:engine-bound`. A set that generates from
 a first frame only answers a text-only `Start` with reason `frame:required`,
 and one that generates from text only answers a first frame with reason
@@ -472,11 +574,30 @@ carries no progress.
 ## What it holds
 
 **[MODELHOST-H1] A load takes a lease first.** The service MUST take a
-lease using the file's size as an admission estimate before the engine starts: `Acquire` on the
+lease using the file's size plus the provider cache recipe's RAM and checkpoint
+forecast as an admission estimate before the engine starts: `Acquire` on the
 declared resource — `card:0` by default — for the number of bytes the
-source reports, waiting the declared time for holders to yield. The runtime
-yields attached holders on this provider's behalf during that wait
-(RES-L2). The lease is taken first and the engine second. File size does not
+source reports plus that forecast, waiting the declared time for holders to yield.
+Every chat engine launch MUST set cache RAM and context checkpoints from the
+provider's settings profile, the model's own or the provider default, and the
+lease MUST count that profile's forecast. An embedding engine sets both to 0.
+Engine defaults MUST NOT add unaccounted cache memory; a resident-slot profile MUST count its slots and preserve its declared context per slot.
+A curated model with a context plan MUST lease the model owner's
+memory for that plan (`modelservice.ContextNeed`): its weights, the KV of
+its context in every resident slot, its startup residual and the margin,
+plus the profile's cache forecast. A checkpoint's forecast is the profile's
+fixed size plus its bytes per token of the slot's context, and the profile's
+per-slot byte cap lowers the checkpoint count to fit at that context.
+Its smaller launches (the planned context with the profile's smaller RAM
+cache, then in fewer slots, then each smaller size in one slot) are offered
+to the holder largest first, and the largest
+the resource service grants without asking anybody starts; with none
+granted, the smallest is acquired asking holders to yield (resource
+RES-L9). The plan's capacity is the one the resource table reports for the
+declared resource; the model host computes no memory figure of its own.
+Reported model load bytes remain the source's file size. The runtime
+asks the planned leases to yield on this provider's behalf during that
+wait (RES-L2). The lease is taken first and the engine second. File size does not
 bound runtime GPU memory: the loader may use more or less, and this lease is
 not a physical memory quota or an assurance that the load will fit. Once
 measured, actual residency above the estimate remains charged (RES-L2).
@@ -496,8 +617,31 @@ carries it in an `Embeddings` `reason`.
 
 **[MODELHOST-H3] An unfinished load gives the lease back.** An engine that
 would not start, and one that was not ready in time, MUST be stopped and
-the lease MUST be released before the caller is told. A grant nobody
+the lease MUST be released before its load failure is returned. A grant nobody
 occupied never stands between the next asker and the bytes.
+
+The provider owns the shared model load within its configured lease-wait
+and engine-readiness budgets. Ending a caller's wait MUST NOT stop that
+load. Normal and speculative waits share the holder's one engine; the
+existing speculative yield rules still apply. Shutdown cancels and joins
+all loads. Admission waits at most one second and answers `unavailable`,
+reason `engine:loading`, while the load continues; a later call can use the
+ready engine. Lease revocation, idle policy and load failure keep their
+existing meaning. This also applies to `preload@1` (INF-PL3).
+
+A finished load failure is retained per model for 30 seconds across normal
+and speculative waits, so a retry receives the failure instead of acquiring
+another lease. Rebuilding the provider for a declaration or pin change
+clears this cache. Load start, readiness and failure records use
+`abstraction-logging`, carrying family, duration and outcome word. Arguments,
+raw paths and engine error text stay out of these structured records.
+
+Chat engine stdout and stderr are retained in provider state under
+`logs/llama-<model hash>.log`, bounded by the provider kit's 8 MiB writer
+with one earlier file. Each launch records its effective arguments, pinned
+release and preparation duration; readiness records its duration and outcome.
+These local logs may contain engine input and MUST NOT be forwarded to a
+caller. The per-launch API key is excluded.
 
 **[MODELHOST-H4] The lease is renewed while loaded.** The service MUST
 renew the lease while the model stays loaded, and a lease the book no
@@ -541,10 +685,15 @@ named lease is no longer resident; a fresh table read can then grant from
 any bytes already freed.
 
 **[MODELHOST-H8] The idle time unloads the same way, per resident.** A
-resident nothing has asked for within the declared idle time MUST be
-stopped and its lease released, on its own clock; a resident still within
-its idle time is untouched by another one's clock running out. The
-provider stays running and serves the next call by loading again.
+resident nothing has asked for within its idle time MUST be stopped and its
+lease released, on its own clock; a resident still within its idle time is
+untouched by another one's clock running out. The provider stays running
+and serves the next call by loading again. A resident's idle time is its
+model family's engine-profile value, from the same per-family data as its
+cache recipe; a family without one uses the declared `--idle` (default 5
+minutes). A longer idle time changes no yield: a resident with no active or
+retained operation still yields its lease on request (MODELHOST-H7), and an
+idle resident holds no wake lease.
 
 **[MODELHOST-H9] Withdrawal ends the provider.** Withdrawing the
 declaration MUST end the provider and its engine. The runtime stops the
@@ -552,6 +701,18 @@ child it launched; the child stops the engine it started.
 `openabstractions models unhost` of the last hosted model withdraws the
 declaration, which is how a person takes the model out of the machine's
 list.
+
+**[MODELHOST-H10] Describe names the residents.** The endpoint
+description MUST state, on `abstraction.inference/chat@1`, the names the
+provider holds loaded now as the display capabilities `resident` (their
+count) and `resident.1` to `resident.<count>`, at most 16. The runtime's
+router reads them as this host's residency under router ROUTE-D14, so the
+Panel and routing see a loaded model. Beside each resident with a context
+plan it MUST state `resident.<n>.context`, the per-conversation context
+that model's engine was started with, while the description stays within
+32 capabilities; the router reports it as that model's effective context
+(ROUTE-D14), exposing the loaded engine’s actual context to clients. These
+display facts grant nothing.
 
 ## What it preloads
 
@@ -562,13 +723,18 @@ them before that request arrives. llama-server reuses its cache only for an
 identical token prefix, and a hybrid or sliding-window model resumes only
 from a context checkpoint at or before the first token that differs.
 
-**[MODELHOST-W1] The prefix is the caller's and nothing is kept.** The
-provider evaluates only the prefix the `Preload` call carries, as the
-inference provider converted it for the chat path. It keeps no prefix
-after the call, learns none from chat requests and writes none anywhere;
-no slot file is ever made (b10825 review condition 2). Per engine it holds
-only whether a request other than a preload has run there since the engine
-started, and the one preload in flight.
+**[MODELHOST-W1] The prefix is the caller's, and the only thing kept is
+the persisted prompt cache.** The provider evaluates only the prefix the
+`Preload` call carries, as the inference provider converted it for the chat
+path. It learns no prefix from chat requests. It keeps no prefix after the
+call and writes none anywhere, with one exception: the persisted prompt
+cache below, whose slot files the provider alone writes to its own private
+directory (b10825 review condition 2 still refuses a person-supplied
+`--slot-save-path`). Per engine it holds only whether a request other than a
+preload has run there since the engine started, and the one preload in
+flight.
+
+Amendment, 2026-11-04 (owner direction 2026-11-03, "make these features great"; `.forks/evidence/review-arch-1101/VERDICTS.md`, "Chat cache design", Layer 3): the model host keeps one bounded cache of its own, the persisted prompt cache. The provider sets `--slot-save-path` itself to an OA-owned private directory under the account's cache root; a person-supplied `--slot-save-path` stays refused. Entries are keyed by (account, app, chat binding), sealed in AEAD envelopes bound to the model digest, engine build and cache-relevant launch facts, marked no-backup, LRU-bounded within the model host's declared limit, and removed by the person's Clear and by app uninstall. A preload's prefix is still the caller's and is never learned from chat requests.
 
 **[MODELHOST-W2] The engine evaluates the prefix the chat route renders,
 as speculative work.** A preload holds the lowest standing, the
@@ -624,7 +790,12 @@ checkpoint the engine is writing, beyond what it would wait on an engine
 that was never asked to preload. A changed prefix costs what the engine
 reuses of the shared tokens and the evaluation of the rest, plus one
 prompt-cache save when the request shares less than half of the evaluated
-tokens and the engine keeps a prompt cache (`--cache-ram`, on by default).
+tokens and the engine keeps a prompt cache (`--cache-ram`, set by the provider's settings profile).
+An engine whose requests name their cache slot runs with
+`--slot-prompt-similarity 0`: llama-server b10825 otherwise loads the best
+match from its one RAM prompt cache into a named slot, and that cache holds
+every partition's parked prompts. A named slot then reuses only what it
+holds itself, which the slot table keeps to one partition.
 
 ## GPU faults
 
@@ -697,13 +868,11 @@ person who does not want a provider holding the card denies that one rule,
 and every call then reads `unavailable` with reason `lease:not_permitted`
 (MODELHOST-H2).
 
-**[MODELHOST-R2] Withdrawing yield.** No `abstraction.resource/yield` rule
-exists for this provider: the book decides no rule for a holder that
-implements `leases@1` (RES-L3 scopes the yield rule to an attached holder,
-yielded "through its host's mechanism"; this provider answers for itself).
-The person's switch for whether this runtime may make the provider let go
-is withdrawing the declaration (MODELHOST-H9), not a resource rule; denying
-a rule that does not exist changes nothing.
+**[MODELHOST-R2] Withdrawing yield.** The per-app switch resource RES-L3
+names is `abstraction.resource/yield` on this provider's program. It is on
+with no rule; a deny keeps the provider's models resident when another
+program asks for the memory. Withdrawing the declaration stops the
+provider entirely (MODELHOST-H9).
 
 **[MODELHOST-R3] The peer check.** Applications never reach this endpoint.
 Their calls travel through the runtime, which binds the caller from the
@@ -767,7 +936,10 @@ downloads no engine and no model. It bundles no llama.cpp,
 stable-diffusion.cpp or PyTorch build and carries no engine of its own; the
 OA PyTorch engine is the PyTorch provider's (VISION 2026-10-02). It writes
 into no other application's directory; that is `abstraction.storage/lend@1`,
-a different provider with a different promise. It serves no images:
+a different provider with a different promise. It links that provider's
+`bridge` package (`go/host/host.go`, `go/host/engine.go`) for the source
+and binding seam MODELHOST-L1 names, a provider-on-provider dependency the
+kit is to own (`research/release-0.8.0/audit/providers.md` §3.4, D8). It serves no images:
 stable-diffusion.cpp image generation is the Lemonade provider's, and the
 PyTorch engine's is the PyTorch provider's. It makes no claim about another application's
 process: an engine ComfyUI or LM Studio started holds its own copy, and

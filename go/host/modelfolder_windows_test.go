@@ -3,10 +3,10 @@ package host
 import (
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
+	identity "github.com/openabstractions/abstraction-identity"
 	"github.com/openabstractions/abstraction-identity/go/privatedir"
 	"golang.org/x/sys/windows"
 )
@@ -41,7 +41,10 @@ func everyoneMay(t *testing.T, p string, set bool) bool {
 // move left on its file; a folder elsewhere, and the root itself, keep their
 // access untouched.
 func TestAdoptModelFolderTouchesOnlyOAsSetFolders(t *testing.T) {
-	base := t.TempDir()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := filepath.Join(base, "OA-models")
 	inside := filepath.Join(root, "video")
 	outside := filepath.Join(base, "AICreator")
@@ -98,13 +101,32 @@ func TestRecordedSetFoldersAreTheOnlySetFolders(t *testing.T) {
 	}
 	got, err := RecordedSetFolders(root, state)
 	want := []string{filepath.Join(root, FastWan22TI2V5B.Name), filepath.Join(root, "video")}
-	if err != nil || !slices.Equal(got, want) {
+	if err != nil || len(got) != len(want) {
 		t.Fatalf("recorded set folders %q, %v; want %q", got, err, want)
+	}
+	// The places record can expand Windows 8.3 aliases before the paths
+	// are sorted. Require each expected folder identity exactly once.
+	expected := make(map[string]bool, len(want))
+	for _, dir := range want {
+		key, err := identity.FileKey(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = true
+	}
+	for _, dir := range got {
+		key, err := identity.FileKey(dir)
+		if err != nil || !expected[key] {
+			t.Fatalf("unexpected or duplicate folder %q, %v; got %q, want %q", dir, err, got, want)
+		}
+		delete(expected, key)
 	}
 	if SetFolderOf(root, filepath.Join(base, "elsewhere", "x")) != "" || SetFolderOf(root, root) != "" {
 		t.Fatal("a path outside the root named a set folder")
 	}
-	home, err := os.UserHomeDir()
+	// The account's home as privatedir names it: the profile known folder,
+	// which stays the account's while the tests' USERPROFILE is a stand-in.
+	home, err := windows.KnownFolderPath(windows.FOLDERID_Profile, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

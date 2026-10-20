@@ -16,7 +16,7 @@ import (
 	"time"
 
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	router "github.com/openabstractions/abstraction-router/go"
 )

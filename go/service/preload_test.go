@@ -1,14 +1,18 @@
 package service
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	identity "github.com/openabstractions/abstraction-identity"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
+	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
+	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 )
 
@@ -39,7 +43,13 @@ func TestPreloadLoadsTheModelAndEvaluatesTheCallersPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, model := serveTransport(t, buildFakeEngine(t), identity.CanonicalProgramPath(filepath.Clean(self)))
+	release := make(chan struct{})
+	transport, model := serveTransport(t, buildFakeEngine(t), identity.CanonicalProgramPath(filepath.Clean(self)), func(o *host.Options) {
+		o.Source = &coldPreloadSource{Source: o.Source, release: release}
+	})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
 	preloader, chatClient := wire.NewPreloaderClient(transport), wire.NewChatClient(transport)
 
 	invalid := prefixRequest("short")
@@ -50,6 +60,14 @@ func TestPreloadLoadsTheModelAndEvaluatesTheCallersPrefix(t *testing.T) {
 
 	system := strings.Repeat("You are a careful assistant on this computer. ", 12)
 	reply, err := preloader.Preload(prefixRequest(system))
+	unblock()
+	if err != nil || reply.Outcome != wire.PreloadOutcomeUnavailable || reply.Reason != "engine:loading" {
+		t.Fatalf("cold preload %+v %v", reply, err)
+	}
+	if _, err := model.EnsureSpeculative(context.Background(), "tiny:1b"); err != nil {
+		t.Fatal(err)
+	}
+	reply, err = preloader.Preload(prefixRequest(system))
 	if err != nil || reply.Outcome != wire.PreloadOutcomeEvaluated || reply.Model != "tiny:1b" || reply.Host == "" {
 		t.Fatalf("preload %+v %v", reply, err)
 	}
@@ -80,4 +98,15 @@ func TestPreloadLoadsTheModelAndEvaluatesTheCallersPrefix(t *testing.T) {
 	if reply, err := preloader.Preload(prefixRequest(system)); err != nil || reply.Outcome != wire.PreloadOutcomeBusy || reply.Reason != "engine:used" || reply.Tokens != 0 {
 		t.Fatalf("a preload after a turn answered %+v %v", reply, err)
 	}
+}
+
+type coldPreloadSource struct {
+	host.Source
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (s *coldPreloadSource) Resolve(store, id string, accepts bridge.Accepts) (host.Object, error) {
+	s.once.Do(func() { <-s.release })
+	return s.Source.Resolve(store, id, accepts)
 }

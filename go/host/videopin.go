@@ -9,9 +9,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	"github.com/openabstractions/abstraction-identity/go/trustedpath"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 
 	identity "github.com/openabstractions/abstraction-identity"
 )
@@ -47,7 +47,7 @@ var SdCppMaster843WindowsVulkan = EnginePin{
 	ArchiveSHA256: "b9248856707de2e125538ede8a7dc71a9d800bba67e469e60881dae2a5a1c0a2",
 	Program:       "sd-server.exe",
 	Review:        videoReview,
-	Files: []enginefiles.File{
+	Files: []programfiles.File{
 		{Path: "ggml-base.dll", Size: 657920, SHA256: "fc4b7d28e9057d915e68a06debe65b4d89eea2a2a0b1d716d6d7a442ad4519c0"},
 		{Path: "ggml-cpu-alderlake.dll", Size: 832000, SHA256: "3a5ab1f52648ff40f73be578f24fba2bfd4eb3680daf66e24b009a70db25488c"},
 		{Path: "ggml-cpu-cannonlake.dll", Size: 876544, SHA256: "8720650111b2856cfdfb8f7a51a5ed7a129fbf78400564f511201a4778218cde"},
@@ -72,12 +72,27 @@ var SdCppMaster843WindowsVulkan = EnginePin{
 	},
 }
 
-// Model roles: the sd-server option each pinned file is passed with.
+// Model roles: the sd-server option each pinned file is passed with. An
+// upscaler is passed by its folder, with --hires-upscalers-dir, and named
+// in the request by its file name without the extension.
 const (
 	RoleDiffusionModel = "--diffusion-model"
 	RoleT5XXL          = "--t5xxl"
 	RoleTAE            = "--tae"
+	RoleLLM            = "--llm"
+	RoleVAE            = "--vae"
+	RoleAudioVAE       = "--audio-vae"
+	RoleUpscaler       = "--hires-upscalers-dir"
 )
+
+// setRoles are the role sets a video model set may pass: Wan 2.2's
+// transformer, umT5 and tiny decoder, and LTX's transformer, Gemma
+// encoder, video VAE and audio VAE with an optional latent upscaler.
+var setRoles = [][]string{
+	{RoleDiffusionModel, RoleT5XXL, RoleTAE},
+	{RoleDiffusionModel, RoleLLM, RoleVAE, RoleAudioVAE},
+	{RoleDiffusionModel, RoleLLM, RoleVAE, RoleAudioVAE, RoleUpscaler},
+}
 
 // A VideoModelSet is one video model as data: the name callers ask for, its
 // reviewed files by role and digest, the reviewed sd-server switches it
@@ -86,7 +101,9 @@ const (
 // Review names; no code changes.
 type VideoModelSet struct {
 	// Name is the model name callers ask for and the router lists.
-	Name   string
+	Name string
+	// Title is the set's display name; empty reads Name.
+	Title  string
 	Review string
 	Files  []VideoModelFile
 	// Options are reviewed sd-server switches every launch of this set
@@ -103,14 +120,34 @@ type VideoModelSet struct {
 	MaxFPS    int
 	// FirstFrame is how the set takes a caller's first frame.
 	FirstFrame FirstFrameUse
+	// FrameStep is the frames one latent frame holds; a request's frames
+	// align to FrameStep·n+1. Zero reads Wan's 4.
+	FrameStep int
+	// PeakBytes is the engine's measured peak commit at the set's largest
+	// preset. The lease asks for it when it exceeds the files' size, and
+	// the engine's memory limit is raised to MemoryLimit for it.
+	PeakBytes int64
+	// MemoryLimit is the per-process limit the set needs; a configured
+	// limit below it is raised to it. Zero keeps the configured one.
+	MemoryLimit uint64
 	// UsePolicy is a use-based policy that travels with the set's weights;
 	// wherever the set's licence is shown (Setup, Panel), it is shown too
 	// and passed to the person. Zero names none.
 	UsePolicy UsePolicy
+	// Timings are measured runs of the set's presets on the reviewed
+	// engine, which Setup's question states. Empty states none.
+	Timings []VideoTiming
+}
+
+// VideoTiming is one measured run: its size, its frames and the seconds it
+// took.
+type VideoTiming struct {
+	Width, Height, Frames int
+	Seconds               int64
 }
 
 // VideoModelSets are the reviewed video models, by name.
-var VideoModelSets = []VideoModelSet{FastWan22TI2V5B, HummingbirdXTI2V}
+var VideoModelSets = []VideoModelSet{FastWan22TI2V5B, HummingbirdXTI2V, LTX25}
 
 // VideoModelSetNamed is the set of VideoModelSets named name.
 func VideoModelSetNamed(name string) (VideoModelSet, bool) {
@@ -205,6 +242,128 @@ var HummingbirdXTI2V = VideoModelSet{
 	},
 }
 
+// ltxReview is the launch review of LTX-2.5 on master-843, whose amendment
+// 1 admits the set in this provider.
+const ltxReview = "research/security-reviews/stable-diffusion.cpp-master-843-462d675-ltx-addendum.md"
+
+// Hugging Face revisions of the LTX-2.5 files: the third-party Q8_0
+// transformer and Lightricks' own repository, which is gated (a person's
+// Hugging Face credential through OA credentials downloads it).
+const (
+	ltxGGUFRevision       = "9a5c1bed3ff27b5e5d055fc04e3ae884381c2343"
+	ltxLightricksRevision = "5e6e71018ee1756ed329b697a7b4aedc934dfce9"
+	ltxLicense            = "LTX-2 Community License"
+)
+
+// LTXUpscaler is the LTX-2.5 latent upscaler's name inside its folder.
+const LTXUpscaler = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0"
+
+// LTXDistilledSigmas is Lightricks' distilled sigma table for eight steps,
+// and LTXRefineSigmas its stage-2 table for the three refine steps at the
+// upscaled size (research/live-runs/2026-10-02.md, phase 3).
+var (
+	LTXDistilledSigmas = []float64{1, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0}
+	LTXRefineSigmas    = []float64{0.909375, 0.725, 0.421875, 0}
+)
+
+// LTXPreset is the LTX-2.5 distilled recipe as research run 3c and 3d ran
+// it: eight Euler steps at guidance 1 on the distilled sigma table, flow
+// shift 2.37 (master-843's LTX default, which the runs used by passing
+// none), 24 fps, WebM with the audio track. The quick preset is 512x512,
+// the size auto reads (25 frames in 160 s). The quality preset is the
+// two-stage 1280x704: generated at 640x352, upscaled x2 in latent space
+// and refined three steps (121 frames in 903 s).
+var LTXPreset = sdcpp.VideoPreset{Steps: 8, TxtCfg: 1, FlowShift: 2.37, SampleMethod: "euler", Scheduler: "ltx2",
+	FPS: 24, Width: 512, Height: 512, OutputFormat: sdcpp.FormatWebM, OutputCompression: 90,
+	Sigmas: LTXDistilledSigmas,
+	Refine: []sdcpp.VideoRefine{{Width: 1280, Height: 704, Upscaler: LTXUpscaler, Steps: 3, Sigmas: LTXRefineSigmas}}}
+
+// LTXGemmaQ8 is the LTX-2.5 Gemma 4 text encoder in Q8_0. The BF16 file
+// aborts master-843 on Vulkan (its embedding table exceeds one Vulkan
+// buffer; LTX addendum condition 3a). This file is the pinned sd-cli's
+// `-M convert --type q8_0` of Lightricks' BF16 encoder, which Source and
+// Revision name; it was converted on 2026-10-02 in 109 s on the CPU.
+var LTXGemmaQ8 = VideoModelFile{Name: "gemma4-12b-with-proj-ltx-2.5-Q8_0.gguf", Role: RoleLLM, Size: 15043601968,
+	SHA256:   "0acd76d05ecf2c81a13d9b11885d4478a5c084cdc1a7841304a5063fe91cbe65",
+	Source:   "https://huggingface.co/Lightricks/LTX-2.5/resolve/" + ltxLightricksRevision + "/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+	Revision: ltxLightricksRevision, License: ltxLicense}
+
+// LTXGemmaBF16 is the Lightricks BF16 encoder LTXGemmaQ8 is converted from.
+var LTXGemmaBF16 = VideoModelFile{Name: "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors", Role: RoleLLM, Size: 26263858182,
+	SHA256:   "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1",
+	Source:   LTXGemmaQ8.Source,
+	Revision: ltxLightricksRevision, License: ltxLicense}
+
+// LTX25 is LTX-2.5 distilled, video with sound, on master-843 (LTX
+// addendum and its amendment 1). Each file is pinned by size and SHA-256:
+// the transformer's equals its LFS SHA-256 at the GGUF revision, and each
+// Lightricks file's LFS pointer rebuilt from its SHA-256 and size equals
+// the pointer blob at Lightricks' revision.
+var LTX25 = VideoModelSet{
+	Name:   "ltx-2.5",
+	Title:  "LTX-2.5 (video with sound)",
+	Review: ltxReview,
+	// Flash attention in the transformer, and a decode tiled in space and
+	// time: research runs 3c and 3d.
+	Options:    []string{"--diffusion-fa", "--vae-tiling", "--temporal-tiling"},
+	Preset:     LTXPreset,
+	Sizes:      [][2]int{{512, 512}, {1280, 704}},
+	MaxFrames:  121,
+	MaxFPS:     24,
+	FirstFrame: FirstFrameNone,
+	FrameStep:  8,
+	// Run 3d peaked at 52.4 GB of engine commit; the limit leaves about
+	// 20 percent above it.
+	PeakBytes:   53 << 30,
+	MemoryLimit: 64 << 30,
+	UsePolicy: UsePolicy{Name: "LTX-2 Community License Agreement", License: ltxLicense,
+		URL: "https://huggingface.co/Lightricks/LTX-2.5/blob/" + ltxLightricksRevision + "/README.md"},
+	// Research runs 3c and 3d (research/live-runs/2026-10-02.md): the quick
+	// preset and the two-stage quality preset.
+	Timings: []VideoTiming{{Width: 512, Height: 512, Frames: 25, Seconds: 160}, {Width: 1280, Height: 704, Frames: 121, Seconds: 903}},
+	Files: []VideoModelFile{
+		{Name: "ltx-2.5-22b-distilled-transformer-Q8_0.gguf", Role: RoleDiffusionModel, Size: 23604666752,
+			SHA256:   "e268b018768e00fa987c128d76384f487f9cf2ac3e3bddb077b979224ded467a",
+			Source:   "https://huggingface.co/vantagewithai/LTX-2.5-GGUF/resolve/" + ltxGGUFRevision + "/distilled/ltx-2.5-22b-distilled-transformer-Q8_0.gguf",
+			Revision: ltxGGUFRevision, License: ltxLicense},
+		LTXGemmaQ8,
+		{Name: "ltx-2.5-video-vae-conv-bf16.safetensors", Role: RoleVAE, Size: 1452269922,
+			SHA256:   "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d",
+			Source:   "https://huggingface.co/Lightricks/LTX-2.5/resolve/" + ltxLightricksRevision + "/vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+			Revision: ltxLightricksRevision, License: ltxLicense},
+		{Name: "ltx-2.5-audio-vae-bf16.safetensors", Role: RoleAudioVAE, Size: 364866540,
+			SHA256:   "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5",
+			Source:   "https://huggingface.co/Lightricks/LTX-2.5/resolve/" + ltxLightricksRevision + "/vae/ltx-2.5-audio-vae-bf16.safetensors",
+			Revision: ltxLightricksRevision, License: ltxLicense},
+		{Name: LTXUpscaler + ".safetensors", Role: RoleUpscaler, Size: 995778752,
+			SHA256:   "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8",
+			Source:   "https://huggingface.co/Lightricks/LTX-2.5/resolve/" + ltxLightricksRevision + "/latent_upscale_models/" + LTXUpscaler + ".safetensors",
+			Revision: ltxLightricksRevision, License: ltxLicense},
+	},
+}
+
+// Derived is the file a set's file is made from when no publisher serves
+// it, and whether there is one: LTX-2.5's Q8_0 encoder is converted from
+// Lightricks' BF16 encoder by the pinned sd-cli.
+func Derived(f VideoModelFile) (VideoModelFile, bool) {
+	if f.SHA256 == LTXGemmaQ8.SHA256 {
+		return LTXGemmaBF16, true
+	}
+	return VideoModelFile{}, false
+}
+
+// DisplayTitle is the set's title, or its name.
+func (s VideoModelSet) DisplayTitle() string {
+	if s.Title != "" {
+		return s.Title
+	}
+	return s.Name
+}
+
+// LeaseBytes is what the set's lease asks for: the measured peak, or the
+// files' size where no peak is recorded or the files are larger.
+func (s VideoModelSet) LeaseBytes() int64 { return max(s.Size(), s.PeakBytes) }
+
 // Size is the set's total size, the lease's admission estimate.
 func (s VideoModelSet) Size() int64 {
 	var n int64
@@ -234,15 +393,45 @@ func (s VideoModelSet) valid() error {
 	}
 	roles := map[string]bool{}
 	for _, f := range s.Files {
+		if roles[f.Role] {
+			return fmt.Errorf("the video model set names two files for %s", f.Role)
+		}
 		roles[f.Role] = true
 	}
-	for _, role := range []string{RoleDiffusionModel, RoleT5XXL, RoleTAE} {
-		if !roles[role] {
-			return fmt.Errorf("the video model set has no file for %s", role)
+	known := false
+	for _, want := range setRoles {
+		match := len(want) == len(roles)
+		for _, role := range want {
+			match = match && roles[role]
 		}
+		known = known || match
 	}
-	if len(roles) != 3 {
-		return errors.New("the video model set names a role sd-server is not given")
+	if !known {
+		return errors.New("the video model set's roles are neither Wan's nor LTX's")
+	}
+	if len(s.Preset.Refine) > 0 {
+		upscaler, ok := s.File(RoleUpscaler)
+		if !ok {
+			return errors.New("the video model set's two-stage preset has no upscaler file")
+		}
+		for _, r := range s.Preset.Refine {
+			if r.Upscaler+filepath.Ext(upscaler.Name) != upscaler.Name || filepath.Ext(upscaler.Name) == "" {
+				return fmt.Errorf("the refine pass names upscaler %q, not the set's %s", r.Upscaler, upscaler.Name)
+			}
+			if !slices.Contains(s.Sizes, [2]int{r.Width, r.Height}) {
+				return fmt.Errorf("the refine size %dx%d is not one of the set's sizes", r.Width, r.Height)
+			}
+		}
+	} else if roles[RoleUpscaler] {
+		return errors.New("the video model set passes an upscaler its preset never names")
+	}
+	switch s.FrameStep {
+	case 0, 4, 8:
+	default:
+		return fmt.Errorf("the video model set's frame step %d is neither 4 nor 8", s.FrameStep)
+	}
+	if s.PeakBytes < 0 {
+		return errors.New("the video model set's peak is negative")
 	}
 	options, err := sdcpp.ParseArgs(s.Options)
 	if err != nil {
@@ -268,8 +457,8 @@ func (s VideoModelSet) valid() error {
 		return errors.New("the video model set's preset size is not one of its sizes")
 	}
 	switch {
-	case sdcpp.AlignFrames(s.MaxFrames) != s.MaxFrames || s.MaxFrames > sdcpp.MaxVideoFrames:
-		return fmt.Errorf("the video model set's %d frames is not 4n+1 within the engine's bound", s.MaxFrames)
+	case sdcpp.AlignFramesTo(s.MaxFrames, s.FrameStep) != s.MaxFrames || s.MaxFrames > sdcpp.MaxVideoFrames:
+		return fmt.Errorf("the video model set's %d frames is not aligned within the engine's bound", s.MaxFrames)
 	case s.MaxFPS < 1 || s.MaxFPS > sdcpp.MaxVideoFPS || s.Preset.FPS > s.MaxFPS:
 		return fmt.Errorf("the video model set's rate %d is outside the engine's bound or below its preset", s.MaxFPS)
 	}

@@ -1,0 +1,27 @@
+{
+  "default": {
+    "cache_ram_mib": 1024,
+    "ctx_checkpoints": 2,
+    "checkpoint_mib": 128,
+    "auto_slots": 4,
+    "answer_reserve_tokens": 256,
+    "reasoning_budgets": {"low": 1024, "medium": 4096, "high": 16384},
+    "default_reasoning_effort": "medium",
+    "reasoning_budget_message": "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n"
+  },
+  "qwen3.6-35b-a3b": {
+    "cache_ram_mib": 1536,
+    "cache_ram_min_mib": 1024,
+    "ctx_checkpoints": 16,
+    "checkpoint_mib": 64,
+    "checkpoint_bytes_per_token": 2080,
+    "checkpoint_cap_mib": 4096,
+    "auto_slots": 4,
+    "slot_context": "divided",
+    "idle_minutes": 30,
+    "answer_reserve_tokens": 256,
+    "reasoning_budgets": {"low": 1024, "medium": 4096, "high": 16384},
+    "default_reasoning_effort": "medium",
+    "reasoning_budget_message": "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n"
+  }
+}

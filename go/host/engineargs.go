@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/llamacpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/llamacpp"
 )
 
 // ErrEngineArgument reports a llama-server argument outside the reviewed list
@@ -39,7 +39,8 @@ type engineFlag struct {
 // --chat-template-file, --api-key-file, --ssl-*, --mmproj, --grammar-file),
 // --chat-template, whose value is a Jinja template, and the options this
 // provider sets itself (--model, --host, --port, --alias, --embeddings,
-// --no-webui).
+// --no-webui, --cache-ram, --ctx-checkpoints, --cache-reuse). The provider
+// owns cache sizing and its Resource lease accounting.
 var engineFlags = map[string]engineFlag{
 	"--ctx-size":              {atLeast(0)},
 	"--n-predict":             {atLeast(-2)},
@@ -58,8 +59,6 @@ var engineFlags = map[string]engineFlag{
 	"--cache-type-k":          {oneOf(cacheTypes...)},
 	"--cache-type-v":          {oneOf(cacheTypes...)},
 	"--pooling":               {oneOf("none", "mean", "cls", "last", "rank")},
-	"--cache-reuse":           {atLeast(0)},
-	"--cache-ram":             {atLeast(-1)},
 	"--timeout":               {atLeast(1)},
 	"--seed":                  {atLeast(-1)},
 	"--reasoning-format":      {oneOf("none", "deepseek", "deepseek-legacy", "auto")},
@@ -90,7 +89,7 @@ var engineFlagNames = map[string]string{
 	"-b": "--batch-size", "-ub": "--ubatch-size", "-t": "--threads", "-tb": "--threads-batch",
 	"-np": "--parallel", "-ngl": "--n-gpu-layers", "--gpu-layers": "--n-gpu-layers",
 	"-sm": "--split-mode", "-mg": "--main-gpu", "-dev": "--device", "-fa": "--flash-attn",
-	"-ctk": "--cache-type-k", "-ctv": "--cache-type-v", "-cram": "--cache-ram", "-to": "--timeout",
+	"-ctk": "--cache-type-k", "-ctv": "--cache-type-v", "-to": "--timeout",
 	"-s": "--seed", "-lv": "--log-verbosity", "--verbosity": "--log-verbosity",
 	"-cb": "--cont-batching", "-nocb": "--no-cont-batching", "-nkvo": "--no-kv-offload",
 	"-kvu": "--kv-unified",

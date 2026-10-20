@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/devicelost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
+	"github.com/openabstractions/abstraction-provider-kit/go/devicelost"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 
 	identity "github.com/openabstractions/abstraction-identity"
@@ -46,7 +47,7 @@ type VideoEngine struct {
 	Places, ModelRecord string
 	// Files proves the engine folder and the placed model files; New makes
 	// one when it is nil.
-	Files *enginefiles.Verifier
+	Files *programfiles.Verifier
 	// Arguments are the sd-server options a person configured; each must
 	// be on the reviewed list (sdcpp.ParseArgs, MODELHOST-V3).
 	Arguments []string
@@ -73,6 +74,15 @@ type VideoEngine struct {
 	deviceLost func(p *Process, marker string)
 	// exited receives the engine's exit record (MODELHOST-E1).
 	exited func(EngineExit)
+}
+
+// memoryLimit is the configured limit, raised to the set's need (a set's
+// measured peak above the default would end every run).
+func (e VideoEngine) memoryLimit() uint64 {
+	if e.MemoryLimit != 0 && e.Set.MemoryLimit > e.MemoryLimit {
+		return e.Set.MemoryLimit
+	}
+	return e.MemoryLimit
 }
 
 // configured reports a video engine configuration that names no pinned
@@ -108,21 +118,21 @@ func (e VideoEngine) configured() error {
 	return nil
 }
 
-func (e VideoEngine) engineTree() enginefiles.Tree {
-	return enginefiles.Tree{Name: "stable-diffusion.cpp " + e.Pin.Release, Root: filepath.Dir(e.Program),
+func (e VideoEngine) engineTree() programfiles.Tree {
+	return programfiles.Tree{Name: "stable-diffusion.cpp " + e.Pin.Release, Root: filepath.Dir(e.Program),
 		Manifest: e.Pin.manifest(), Record: e.Record}
 }
 
 // placed is each pinned model file where the places record says it lies,
 // as enginefiles proves it in place (INF-F7).
-func (e VideoEngine) placed() ([]enginefiles.Placed, map[string]string, error) {
+func (e VideoEngine) placed() ([]programfiles.Placed, map[string]string, error) {
 	where, owners, err := readPlacesOwned(e.Places, e.Set)
 	if err != nil {
 		return nil, nil, err
 	}
-	out := make([]enginefiles.Placed, 0, len(e.Set.Files))
+	out := make([]programfiles.Placed, 0, len(e.Set.Files))
 	for _, f := range e.Set.Files {
-		out = append(out, enginefiles.Placed{Path: where[f.Name], Size: f.Size, SHA256: f.SHA256, Owners: owners[f.Name]})
+		out = append(out, programfiles.Placed{Path: where[f.Name], Size: f.Size, SHA256: f.SHA256, Owners: owners[f.Name]})
 	}
 	return out, where, nil
 }
@@ -142,6 +152,9 @@ func (e VideoEngine) present(ctx context.Context) error {
 		return err
 	}
 	if err := e.Files.CheckPlaced(ctx, e.Set.Name, files, e.ModelRecord); err != nil {
+		if plain := placedProblem(err, downloadVideoAgain); plain != "" {
+			return fmt.Errorf("%s (%w)", plain, err)
+		}
 		return fmt.Errorf("the %s files are not the pinned ones where they were placed (%w); place them again with modelhostd models install --kind sdcpp", e.Set.Name, err)
 	}
 	return nil
@@ -153,7 +166,7 @@ func (e VideoEngine) present(ctx context.Context) error {
 func CheckVideoEngine(ctx context.Context, program, record string) error {
 	//unchecked: a platform with no pin leaves pin zero, which configured refuses by name
 	pin, _ := PinnedVideoEngine(runtime.GOOS, runtime.GOARCH)
-	e := VideoEngine{Program: program, Pin: pin, Record: record, Files: enginefiles.NewVerifier(enginefiles.Options{})}
+	e := VideoEngine{Program: program, Pin: pin, Record: record, Files: programfiles.NewVerifier(programfiles.Options{})}
 	if e.Program == "" || !filepath.IsAbs(e.Program) {
 		return errors.New("the engine path must be absolute")
 	}
@@ -168,7 +181,7 @@ func CheckVideoEngine(ctx context.Context, program, record string) error {
 
 // CheckVideoModels proves set's files where places says they lie, as a
 // video does before its lease.
-func CheckVideoModels(ctx context.Context, files *enginefiles.Verifier, set VideoModelSet, places, record string) error {
+func CheckVideoModels(ctx context.Context, files *programfiles.Verifier, set VideoModelSet, places, record string) error {
 	e := VideoEngine{Set: set, Places: places, ModelRecord: record}
 	placed, _, err := e.placed()
 	if err != nil {
@@ -198,15 +211,22 @@ func (e VideoEngine) arguments(port int, where map[string]string) ([]string, err
 		return nil, err
 	}
 	a.ListenPort = port
-	for role, path := range map[string]*string{RoleDiffusionModel: &a.DiffusionModel, RoleT5XXL: &a.T5XXL, RoleTAE: &a.TAE} {
-		f, ok := e.Set.File(role)
+	fields := map[string]*string{RoleDiffusionModel: &a.DiffusionModel, RoleT5XXL: &a.T5XXL, RoleTAE: &a.TAE,
+		RoleLLM: &a.LLM, RoleVAE: &a.VAE, RoleAudioVAE: &a.AudioVAE, RoleUpscaler: &a.HiresUpscalersDir}
+	for _, f := range e.Set.Files {
+		path, ok := fields[f.Role]
 		if !ok {
-			return nil, fmt.Errorf("the model set has no file for %s", role)
+			return nil, fmt.Errorf("the model set passes %s, which sd-server is not given", f.Role)
 		}
 		if !filepath.IsAbs(where[f.Name]) {
 			return nil, fmt.Errorf("no place is recorded for %s", f.Name)
 		}
 		*path = where[f.Name]
+		if f.Role == RoleUpscaler {
+			// sd-server resolves the request's upscaler name inside this
+			// folder, where the held file lies.
+			*path = filepath.Dir(where[f.Name])
+		}
 	}
 	return a.Build()
 }
@@ -290,6 +310,9 @@ func (e VideoEngine) start(port int) (*Process, error) {
 	if err != nil {
 		//unchecked: the refusal below is the error returned; a failed close leaves only read-shared handles
 		engineHold.Release()
+		if plain := placedProblem(err, downloadVideoAgain); plain != "" {
+			return nil, refuse(NoEngine, "%s", plain)
+		}
 		return nil, refuse(NoEngine, "the %s files: %v", e.Set.Name, err)
 	}
 	release := func() error {
@@ -343,7 +366,7 @@ func (e VideoEngine) start(port int) (*Process, error) {
 		return nil, refuse(Unavailable, "the engine client: %v", errors.Join(err, cleanupErr))
 	}
 	p, err := startOwnedProcess(ownedSpec{Program: e.Program, Args: append(args, e.fixture...), Env: env, Output: tap,
-		MemoryLimit: e.MemoryLimit, Engine: "sd-server", Model: e.Set.Name, Exited: e.exited})
+		MemoryLimit: e.memoryLimit(), Engine: "sd-server", Model: e.Set.Name, Exited: e.exited})
 	if err != nil {
 		release()
 		if log != nil {
@@ -353,6 +376,10 @@ func (e VideoEngine) start(port int) (*Process, error) {
 		return nil, err
 	}
 	started = p
+	e.logTransport(output)
+	if modelHold.Hashed() < len(placed) {
+		startWarming(warmOrder(e.Set, where), p.exited, output)
+	}
 	cleaned := make(chan struct{})
 	p.cleaned = cleaned
 	go func() {
@@ -372,6 +399,15 @@ func (e VideoEngine) start(port int) (*Process, error) {
 	p.client = client
 	lost.Bind(p)
 	return p, nil
+}
+
+func (e *VideoEngine) logTransport(output io.Writer) {
+	const reason = "IPC not implemented in this adopter"
+	slog.Info("engine transport", "engine", "sd-server", "pin", e.Pin.Release, "transport", "tcp-loopback", "reason", reason)
+	if output != nil {
+		//unchecked: informational diagnostics do not alter the admitted launch
+		fmt.Fprintf(output, "INFO engine=sd-server pin=%q transport=tcp-loopback reason=%q\n", e.Pin.Release, reason)
+	}
 }
 
 // videoReady is sd-server's readiness: GET /sdcpp/v1/capabilities answers

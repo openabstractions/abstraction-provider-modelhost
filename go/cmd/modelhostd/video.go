@@ -10,10 +10,11 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 
 	"github.com/openabstractions/abstraction-provider-kit/go/modelplace"
 	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
+	"github.com/openabstractions/abstraction-storage/go/layout"
 )
 
 // Engine kinds the engine and models commands take. The OA PyTorch engine
@@ -44,17 +45,18 @@ func videoMemoryFlag(fs *flag.FlagSet) *uint64 {
 	return fs.Uint64("video-memory-limit", defaultVideoMemoryLimit(), "")
 }
 
-// videoInputLimit bounds one first frame the runtime stages in the
-// provider's content store; sd-server's frame bound is 16 MiB.
-const videoInputLimit = 20 << 20
+// contentInputLimit bounds one input the runtime stages in the provider's
+// content store: a chat image (inference's image bound, 20 MiB) or a first
+// frame (sd-server's frame bound is 16 MiB).
+const contentInputLimit = 20 << 20
 
-// defaultFolder is <user cache>/OpenAbstractions/<kind>/<name>.
-func defaultFolder(kind, name string) (string, error) {
-	cache, err := os.UserCacheDir()
+// defaultVideoEngineFolder retains the video CLI's native-root error wording.
+func defaultVideoEngineFolder(release string) (string, error) {
+	folder, err := layout.DefaultEngineDir("sd.cpp", release)
 	if err != nil {
 		return "", fmt.Errorf("no default folder; pass --dir: %w", err)
 	}
-	return filepath.Join(cache, "OpenAbstractions", kind, name), nil
+	return folder, nil
 }
 
 // runVideoEngine stages, checks and releases the pinned sd-server folder
@@ -72,17 +74,22 @@ func runVideoEngine(command, archive, dir, engine, stateDir string, engineArgs [
 		if archive == "" {
 			return fail(2, "--archive names the downloaded %s", pin.Archive)
 		}
+		state, err := stateFolder(stateDir)
+		if err != nil {
+			return fail(2, "%v", err)
+		}
 		target := dir
-		if target == "" {
-			folder, err := defaultFolder("engines", "sd.cpp-"+pin.Release)
+		switch {
+		case target != "":
+		case stateDir != "":
+			// A named state folder keeps its own engine (as llama.cpp's does).
+			target = filepath.Join(state, "engines", "sd.cpp-"+pin.Release)
+		default:
+			folder, err := defaultVideoEngineFolder(pin.Release)
 			if err != nil {
 				return fail(2, "%v", err)
 			}
 			target = folder
-		}
-		state, err := stateFolder(stateDir)
-		if err != nil {
-			return fail(2, "%v", err)
 		}
 		source, err := filepath.Abs(archive)
 		if err != nil {
@@ -91,7 +98,7 @@ func runVideoEngine(command, archive, dir, engine, stateDir string, engineArgs [
 		if target, err = filepath.Abs(target); err != nil {
 			return fail(2, "%v", err)
 		}
-		program, err := host.InstallEngine(context.Background(), enginefiles.NewVerifier(enginefiles.Options{}),
+		program, err := host.InstallEngine(context.Background(), programfiles.NewVerifier(programfiles.Options{}),
 			pin, source, target, host.VideoEngineRecord(state, pin))
 		if err != nil {
 			return fail(1, "%v", err)
@@ -145,7 +152,7 @@ func unlockRecorded(dir, stateDir string, record func(string) string, stdout io.
 	if err := host.RecordedEngine(path, target); err != nil {
 		return fail(1, "%v", err)
 	}
-	if err := enginefiles.UnlockWithin(target); err != nil {
+	if err := programfiles.UnlockWithin(target); err != nil {
 		return fail(1, "%v", err)
 	}
 	//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
@@ -178,7 +185,8 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	home := fs.String("home", "", "")
 	stateDir := fs.String("state", "", "")
 	modelsRoot := fs.String("models-root", "", "")
-	jobStore := fs.String("job-store", defaultJobStore(getenv), "")
+	var jobStore modelplace.JobStoreFlag
+	fs.Var(&jobStore, "job-store", "")
 	dryRun := fs.Bool("dry-run", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
@@ -204,13 +212,7 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	if root != "" && !filepath.IsAbs(root) {
 		return fail(2, "--models-root names an absolute folder")
 	}
-	var linkRoots []string
-	if *jobStore != "" {
-		if !filepath.IsAbs(*jobStore) {
-			return fail(2, "--job-store names an absolute folder")
-		}
-		linkRoots = append(linkRoots, filepath.Clean(*jobStore))
-	}
+	linkRoots := jobStore.OwnedRoots(getenv)
 	if args[0] == "protect" {
 		state, err := statePath(*stateDir)
 		if err != nil {
@@ -252,7 +254,7 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 		if code := adoptSetFolders(root, linkRoots, set.Files, found, stdout, fail); code != 0 {
 			return code
 		}
-		if err := host.CheckVideoModels(context.Background(), enginefiles.NewVerifier(enginefiles.Options{}), set, places, record); err != nil {
+		if err := host.CheckVideoModels(context.Background(), programfiles.NewVerifier(programfiles.Options{}), set, places, record); err != nil {
 			return fail(1, "%v", err)
 		}
 		for _, f := range set.Files {
@@ -266,7 +268,7 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 		if len(from) > 0 {
 			return fail(2, "--from belongs to models install")
 		}
-		if err := host.CheckVideoModels(context.Background(), enginefiles.NewVerifier(enginefiles.Options{}), set, places, record); err != nil {
+		if err := host.CheckVideoModels(context.Background(), programfiles.NewVerifier(programfiles.Options{}), set, places, record); err != nil {
 			return fail(1, "%v", err)
 		}
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
@@ -332,6 +334,3 @@ func protectModelFolders(root, state string, linkRoots []string, dryRun bool, st
 	}
 	return 0
 }
-
-// defaultJobStore is the runtime's managed job store (modelplace).
-func defaultJobStore(getenv func(string) string) string { return modelplace.DefaultJobStore(getenv) }

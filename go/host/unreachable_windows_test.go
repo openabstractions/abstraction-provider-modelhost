@@ -9,8 +9,8 @@ import (
 	"time"
 
 	identity "github.com/openabstractions/abstraction-identity"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 )
 
 // A socket path the client can never connect to ends the load within

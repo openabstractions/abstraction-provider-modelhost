@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	"golang.org/x/sys/windows"
 )

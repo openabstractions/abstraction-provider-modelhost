@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 )
 
 // launchDir is the launch directory of name's running engine.
@@ -210,7 +210,7 @@ func TestNewSweepsAStaleLaunchDirectory(t *testing.T) {
 func TestASocketFolderTooLongIsRefused(t *testing.T) {
 	engine := pinnedEngine(t)
 	engine.Sockets = filepath.Join(engine.Sockets, strings.Repeat("s", enginelaunch.MaxSocketPath))
-	_, err := New(Options{Models: []Model{{Name: "tiny:1b", Store: "fake", Object: "tiny"}}, Engine: engine,
+	_, err := newTestHost(Options{Models: []Model{{Name: "tiny:1b", Store: "fake", Object: "tiny"}}, Engine: engine,
 		Source: fakeSource{}, Leases: newFakeLeases()})
 	if !errors.Is(err, enginelaunch.ErrSocketPath) {
 		t.Fatalf("a socket folder too long: %v", err)

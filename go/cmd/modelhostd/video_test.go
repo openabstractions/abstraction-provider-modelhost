@@ -8,7 +8,34 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	identity "github.com/openabstractions/abstraction-identity"
+	"github.com/openabstractions/abstraction-storage/go/layout"
 )
+
+func TestDefaultVideoEngineFolderSharesAccountDataEngines(t *testing.T) {
+	cache := accountDataFixture(t)
+	got, err := defaultVideoEngineFolder("fixture-release")
+	want := filepath.Join(cache, "OpenAbstractions", "engines", "sd.cpp-fixture-release")
+	if err != nil || got != want {
+		t.Fatalf("video default changed: %q %v, want %q", got, err, want)
+	}
+	if err := os.MkdirAll(want, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := identity.SameFile(filepath.Dir(got), layout.EngineCacheRoot(cache)); err != nil || !same {
+		t.Fatalf("video uses another existing engines root: %v %v", same, err)
+	}
+}
+
+func TestDefaultVideoEngineFolderPreservesNativeError(t *testing.T) {
+	unsetAccountData(t)
+	_, nativeErr := layout.AccountData()
+	got, err := defaultVideoEngineFolder("fixture-release")
+	if nativeErr == nil || err == nil || got != "" || err.Error() != "no default folder; pass --dir: "+nativeErr.Error() {
+		t.Fatalf("video native error changed: root=%q error=%v native=%v", got, err, nativeErr)
+	}
+}
 
 func noEnv(string) string { return "" }
 
@@ -159,11 +186,39 @@ func TestTheTorchKindIsRefusedNamingItsProvider(t *testing.T) {
 func TestVideoEngineArgumentIsRefusedByName(t *testing.T) {
 	for _, arg := range []string{"--lora-model-dir=x", "-M", "--listen-ip=0.0.0.0", "--steps"} {
 		var out, errs bytes.Buffer
-		status := run([]string{"serve", "--endpoint", "modelhost-video-arg-test", "--video-model", "fastwan2.2-ti2v-5b",
+		status := run([]string{"serve", "--endpoint", explicitFixtureEndpoint(t, "modelhost-video-arg-test"), "--video-model", "fastwan2.2-ti2v-5b",
 			"--video-engine-arg", arg}, &out, &errs, noEnv)
 		name, _, _ := strings.Cut(arg, "=")
 		if status != 2 || !strings.Contains(errs.String(), name) {
 			t.Fatalf("%s: status %d, stderr %q", arg, status, errs.String())
 		}
 	}
+}
+
+// accountDataFixture points layout.AccountData at a fresh folder and returns
+// it: %LOCALAPPDATA% on Windows, the data root under $HOME on macOS and
+// $XDG_DATA_HOME on Linux.
+func accountDataFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	switch runtime.GOOS {
+	case "windows":
+		t.Setenv("LOCALAPPDATA", dir)
+		return dir
+	case "darwin":
+		t.Setenv("HOME", dir)
+		return filepath.Join(dir, "Library", "Application Support", "openabstractions")
+	default:
+		t.Setenv("HOME", dir)
+		t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+		return filepath.Join(dir, "data", "openabstractions")
+	}
+}
+
+// unsetAccountData leaves layout.AccountData no base to resolve.
+func unsetAccountData(t *testing.T) {
+	t.Helper()
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
 }

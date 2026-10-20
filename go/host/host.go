@@ -4,18 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"net/http"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginehttp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginehttp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 	"github.com/openabstractions/abstraction-provider-kit/go/engineproc"
 	"github.com/openabstractions/abstraction-provider-kit/go/refusal"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
@@ -54,7 +58,12 @@ func unboundObject(store, object string) string {
 	return fmt.Sprintf("object:unbound:%s/%s", store, object)
 }
 
-type Model struct{ Name, Store, Object string }
+type Model struct {
+	Name, Store, Object string
+	// Content is the explicit expected file pin carried by this allowlist entry.
+	// Path is unused; the source resolves the object binding for every load.
+	Content *programfiles.File
+}
 type Leases = holder.Leases
 
 type Options struct {
@@ -66,7 +75,12 @@ type Options struct {
 	Idle     time.Duration
 	// Active includes pending admissions and retained operations. The
 	// inference provider reserves activity before it calls Ensure.
-	Active      func(model string) bool
+	Active func(model string) bool
+	// InFlight counts a model's admissions in progress and its calls still
+	// running, without replies kept only for observation. With it, a yield
+	// waits for the model's next request boundary and new admissions wait
+	// behind it (resource RES-L3); without it, a yield waits for Active.
+	InFlight    func(model string) int
 	Renew, Wait time.Duration
 	Now         func() time.Time
 	OnError     func(error)
@@ -81,6 +95,13 @@ type Options struct {
 	// each engine's own device-lost line (resource CONTRACT.md RES-G1..G7,
 	// MODELHOST-G1).
 	GPU *gpufault.Guard
+	// Capacity, when set, answers the bytes this machine's memory pool holds
+	// for a model's context plan, and zero when unknown. It is read at each
+	// load of a curated model.
+	Capacity func(context.Context) int64
+	// ContextChoice, when set, answers the person's per-conversation context
+	// for a model family, and zero for Automatic. It is read at each load.
+	ContextChoice func(context.Context, string) int64
 }
 
 const DefaultResource = "card:0"
@@ -93,18 +114,33 @@ const (
 // Host resolves model objects and owns llama.cpp processes. holder.Holder
 // owns lease lifecycle and serializes each model's Ensure with its yield.
 type Host struct {
-	options   Options
-	allow     map[string]Model
-	names     []string
-	bases     map[string]string
-	hosts     map[string]string
-	resources *holder.Holder
+	loadMu       sync.Mutex
+	loads        map[string][2]*modelLoad
+	loadFailures map[string]modelLoadFailure
+	loadLogger   *slog.Logger
+	loadLogClose func()
+	loadWG       sync.WaitGroup
+	loadCtx      context.Context
+	loadCancel   context.CancelFunc
+	loadClosed   bool
+	options      Options
+	allow        map[string]Model
+	names        []string
+	bases        map[string]string
+	hosts        map[string]string
+	resources    *holder.Holder
 	// engines holds each running engine by the host name of its base
 	// (MODELHOST-L7, MODELHOST-L8).
 	engineMu sync.Mutex
 	engines  map[string]*Process
 	// video is the video engine kind, or nil.
 	video *videoHost
+	// context holds each loaded model's context plan, the families whose
+	// choice changed while loaded, and the fit fallback's limits
+	// (contextreload.go).
+	context contextState
+	// idle holds each loaded model's own idle time (idle.go).
+	idle idleState
 	// warm holds, per engine, whether a request used it since it started
 	// and the one preload in flight (MODELHOST-W1..W3); warmClient reaches
 	// the engines for the preload.
@@ -115,6 +151,12 @@ type Host struct {
 	// afterFailedCheck, set by tests only, runs between a failed running
 	// socket check and the stop it leads to.
 	afterFailedCheck func()
+	// recheckEvery and userIdle, set by tests only, replace the background
+	// re-hash's period and the session's input idle time (recheck.go).
+	recheckEvery time.Duration
+	userIdle     func() time.Duration
+	// facts caches each chat model's capabilities (facts.go).
+	facts factsState
 }
 
 // engineHost is the host of name's base URL. It names no network address:
@@ -187,23 +229,14 @@ const resourcesHeld = "resources:held"
 // nothing falls back to Ensure. A refused acquire, a lease service without
 // the no-yield acquire, and a load a yield cancelled read resourcesHeld.
 func (h *Host) EnsureSpeculative(ctx context.Context, name string) (string, error) {
-	model, ok := h.allow[name]
-	if !ok {
-		return "", refuse(Unavailable, "no model called %q is hosted here", name)
-	}
-	var amount int64
-	err := h.resources.EnsureSpeculative(ctx, name, h.component(ctx, name, model, &amount))
-	var failure *holder.Failure
-	if errors.As(err, &failure) && failure.Word() == holder.WordHeld {
-		return "", refuse(resourcesHeld, "loading %s would ask a holder of %s to yield", name, h.options.Resource)
-	}
-	if err != nil {
-		return "", h.mapFailure(name, amount, err)
-	}
-	return h.bases[name], nil
+	return h.ensureShared(ctx, name, true)
 }
 
 func New(options Options) (*Host, error) {
+	return newHost(options, resolvedDiagnostics)
+}
+
+func newHost(options Options, diagnostics func(string) (slog.Handler, func())) (*Host, error) {
 	if options.Source == nil {
 		return nil, errors.New("modelhost: a source is required")
 	}
@@ -240,7 +273,19 @@ func New(options Options) (*Host, error) {
 	options.Engine.report = options.OnError
 	options.Engine.exited = options.OnEngineExit
 	if options.Engine.Files == nil {
-		options.Engine.Files = enginefiles.NewVerifier(enginefiles.Options{})
+		// Records in this provider's state folder prove placed model files
+		// for later provider processes too (INF-F7, Decision 2).
+		var state string
+		switch {
+		case options.Engine.Record != "":
+			state = filepath.Dir(options.Engine.Record)
+		case options.Video != nil && options.Video.Engine.ModelRecord != "":
+			state = filepath.Dir(options.Video.Engine.ModelRecord)
+		}
+		options.Engine.Files = programfiles.NewVerifier(programfiles.Options{StateRoot: state})
+		if state != "" && options.OnError != nil {
+			logStateOnce(state, options.Engine.Files, options.OnError)
+		}
 	}
 	// A configured engine's socket root must give paths the engine can
 	// bind; launch directories a stopped provider left behind are removed
@@ -313,6 +358,19 @@ func New(options Options) (*Host, error) {
 		Admit:  admit,
 		Leases: options.Leases, Resource: options.Resource, Idle: options.Idle,
 		Renew: options.Renew, Wait: options.Wait, Now: options.Now,
+		// Each lease is labelled with the model it holds for the person's
+		// Memory view (resource RES-L10). The runtime forwards the work, so
+		// the app that asked is not known here and the label is the model
+		// alone.
+		Label: func(name string) string { return name },
+		// A resident's idle time is its family's engine-profile value, else
+		// the declared --idle (MODELHOST-H8).
+		IdleFor: func(name string) time.Duration {
+			if h == nil {
+				return 0
+			}
+			return h.residentIdle(name)
+		},
 		// The video engine is in use while video work is queued or running
 		// (video addendum condition 6); a chat model while the inference
 		// provider holds a request for it (MODELHOST-H6).
@@ -322,14 +380,22 @@ func New(options Options) (*Host, error) {
 			}
 			return options.Active != nil && options.Active(name)
 		},
-		OnError: options.OnError,
+		InFlight: inFlight(options, func() *Host { return h }),
+		OnError:  options.OnError,
 	})
 	if err != nil {
 		return nil, err
 	}
+	handler, closeDiagnostics := diagnostics("modelhostd")
 	h = &Host{options: options, allow: map[string]Model{},
 		bases: map[string]string{}, hosts: map[string]string{}, resources: r, engines: map[string]*Process{},
-		watch: socketWatch, warm: newWarmer()}
+		watch: socketWatch, warm: newWarmer(), loadLogger: slog.New(handler), loadLogClose: closeDiagnostics}
+	constructed := false
+	defer func() {
+		if !constructed {
+			h.Close()
+		}
+	}()
 	h.warmClient = EngineClient(h, options.OnError)
 	if options.GPU != nil {
 		// A reset stops every engine through the holder (resource RES-G2).
@@ -338,6 +404,10 @@ func New(options Options) (*Host, error) {
 	for _, m := range options.Models {
 		if m.Name == "" || m.Store == "" || m.Object == "" {
 			return nil, fmt.Errorf("modelhost: model %q needs a name, a store and an object", m.Name)
+		}
+		if m.Content != nil {
+			pin := *m.Content
+			m.Content = &pin
 		}
 		h.allow[m.Name] = m
 		h.names = append(h.names, m.Name)
@@ -352,7 +422,27 @@ func New(options Options) (*Host, error) {
 			return nil, err
 		}
 	}
+	constructed = true
 	return h, nil
+}
+
+// inFlight is the holder's InFlight for options: nil without the
+// provider's count, so a yield keeps waiting for Active. The video engine's
+// queued or running work counts as one request; its admissions do not pass
+// the yield gate.
+func inFlight(options Options, host func() *Host) func(string) int {
+	if options.InFlight == nil {
+		return nil
+	}
+	return func(name string) int {
+		if h := host(); h != nil && h.video != nil && name == h.video.opts.Model {
+			if h.video.active() {
+				return 1
+			}
+			return 0
+		}
+		return options.InFlight(name)
+	}
 }
 
 func (h *Host) Models() []string { return append([]string(nil), h.names...) }
@@ -365,26 +455,29 @@ func (h *Host) Residents() []string      { return h.resources.Residents() }
 func (h *Host) Loaded(name string) bool  { _, ok := h.resources.Snapshot(name); return ok }
 func (h *Host) Lease(name string) string { lease, _ := h.resources.Snapshot(name); return lease }
 
+// CheckModel validates the immutable model and engine capture before chat
+// acceptance. Object resolution, file proof, leasing and loading stay in Ensure.
+func (h *Host) CheckModel(name string) error {
+	if !h.Serves(name) || h.Base(name) == "" {
+		return refuse(Unavailable, "no model called %q is hosted here", name)
+	}
+	if err := h.options.Engine.configured(); err != nil {
+		return refuse(NoEngine, "%v", err)
+	}
+	return nil
+}
+
 // Ensure loads an allowlisted model under a lease. Every mediated inference
 // call reaches this hook after Provider reserves model activity. A call racing
 // a yield waits on the same component lock and reloads once yield completes.
 func (h *Host) Ensure(ctx context.Context, name string) (string, error) {
-	model, ok := h.allow[name]
-	if !ok {
-		return "", refuse(Unavailable, "no model called %q is hosted here", name)
-	}
-	var amount int64
-	err := h.resources.Ensure(ctx, name, h.component(ctx, name, model, &amount))
-	if err != nil {
-		return "", h.mapFailure(name, amount, err)
-	}
-	return h.bases[name], nil
+	return h.ensureShared(ctx, name, false)
 }
 
 // component is name's load as the holder runs it: the object resolved and
 // its engine proven before any lease is asked for, then the engine started
 // under the lease. amount receives the object's size.
-func (h *Host) component(ctx context.Context, name string, model Model, amount *int64) func() (holder.Component, error) {
+func (h *Host) component(ctx context.Context, name string, model Model, amount, charged *int64, leased *atomic.Bool) func() (holder.Component, error) {
 	return func() (holder.Component, error) {
 		object, err := h.options.Source.Resolve(model.Store, model.Object, h.options.Engine.accepts())
 		if errors.Is(err, bridge.ErrPickle) {
@@ -395,6 +488,9 @@ func (h *Host) component(ctx context.Context, name string, model Model, amount *
 		}
 		if err != nil {
 			return holder.Component{}, refuse(unknownObject(model.Store, model.Object), "no store called %s holds %s", model.Store, model.Object)
+		}
+		if model.Content != nil && object.Size != model.Content.Size {
+			return holder.Component{}, refuse(Unavailable, "the model size differs from its explicit content pin")
 		}
 		if err := h.options.Engine.present(ctx); err != nil {
 			var refusal *Refusal
@@ -408,18 +504,84 @@ func (h *Host) component(ctx context.Context, name string, model Model, amount *
 			return holder.Component{}, refuse(Unavailable, "the source reports no size for %s/%s", model.Store, model.Object)
 		}
 		// The holder runs Start only after Acquire granted Amount on the
-		// declared resource (holder.Component), so the grant is the file's
-		// whole size on that resource (MODELHOST-H1, MODELHOST-L9).
+		// declared resource (holder.Component), so the grant covers the
+		// file's whole size on that resource (MODELHOST-H1, MODELHOST-L9).
+		// A curated model's launches each lease what they use: its weights
+		// and the KV of its context (resource RES-L9). The holder starts the
+		// largest that fits what is free.
 		grant := leaseGrant{resource: h.options.Resource, size: object.Size}
-		return holder.Component{Amount: *amount, Start: func() (holder.Owned, error) {
-			process, err := h.options.Engine.start(object.Path, name, grant)
-			if err != nil {
-				return nil, err
+		engines := h.modelEngines(model, object)
+		// A vision projector beside the model loads with it (--mmproj), and
+		// its bytes are part of every launch's lease (MODELHOST-L12).
+		projector, hasProjector := h.projector(object)
+		h.noteResolved(name, model, object, projector, hasProjector)
+		var loads []holder.Component
+		for i := range engines {
+			if hasProjector && !engines[i].Embeddings {
+				engines[i].projector = projector.Path
 			}
-			h.setEngine(name, process)
-			return &ownedProcess{name: name, process: process, ready: h.options.Engine.Ready, host: h}, nil
-		}}, nil
+		}
+		for _, engine := range engines {
+			if err := engine.cacheRecipe().checkArguments(engine.Arguments); err != nil {
+				return holder.Component{}, refuse(Unavailable, "%v", err)
+			}
+			// A curated plan's need covers weights, KV and the engine's own
+			// buffers; the prompt cache and checkpoints come on top of it.
+			leaseBytes, err := engine.cacheRecipe().leaseBytes(object.Size)
+			if plan := engine.contextLoad; err == nil && plan != nil && plan.need > object.Size {
+				leaseBytes, err = engine.cacheRecipe().addTo(plan.need)
+			}
+			if err != nil {
+				return holder.Component{}, refuse(Unavailable, "%v", err)
+			}
+			if engine.projector != "" {
+				if projector.Size > math.MaxInt64-leaseBytes {
+					return holder.Component{}, refuse(Unavailable, "the model and its projector overflow a lease")
+				}
+				leaseBytes += projector.Size
+			}
+			loads = append(loads, h.engineLoad(ctx, name, engine, object, grant, leaseBytes, charged, leased))
+		}
+		// A load that does not start records the largest plan, so a fit
+		// fallback after it lowers from there.
+		h.recordContextLoad(name, engines[0].contextLoad)
+		h.recordIdle(name, engines[0].cacheRecipe().idle)
+		*charged = loads[0].Amount
+		main := loads[0]
+		main.Smaller = loads[1:]
+		return main, nil
 	}
+}
+
+// engineLoad is one launch of name's engine as a holder load: started only
+// under its own grant of amount, recording the plan and the charge it runs.
+func (h *Host) engineLoad(ctx context.Context, name string, engine Engine, object Object, grant leaseGrant, amount int64, charged *int64, leased *atomic.Bool) holder.Component {
+	return holder.Component{Amount: amount, Start: func() (holder.Owned, error) {
+		leased.Store(true)
+		h.recordContextLoad(name, engine.contextLoad)
+		*charged = amount
+		load, _ := ctx.Value(modelLoadKey{}).(*modelLoad)
+		if load != nil {
+			load.progress.begin()
+			engine.loadPhase = load.progress.publish
+		}
+		process, err := engine.start(object.Path, name, grant)
+		if err != nil {
+			return nil, err
+		}
+		if load != nil {
+			load.started = true
+			load.readyAt = time.Time{}
+		}
+		recipe := engine.cacheRecipe()
+		process.requestSettings = recipe.requestSettings
+		process.answerReserve = recipe.answerReserve
+		if recipe.pinsSlots() {
+			process.cacheSlots = newCacheSlots(max(recipe.slots, recipe.residentSlots))
+		}
+		h.setEngine(name, process)
+		return &ownedProcess{name: name, process: process, ready: h.options.Engine.Ready, host: h, load: load}, nil
+	}}
 }
 
 type ownedProcess struct {
@@ -427,6 +589,7 @@ type ownedProcess struct {
 	process *Process
 	ready   time.Duration
 	host    *Host
+	load    *modelLoad
 }
 
 // kit is the provider kit's holder.Owned for this engine (KIT-P5): its
@@ -438,8 +601,13 @@ func (o *ownedProcess) kit() *engineproc.Owned {
 		ready = DefaultReady
 	}
 	h, p := o.host, o.process
+	var progress func() uint64
+	if p.loadProgress != nil {
+		progress = p.loadProgress.count
+	}
 	return &engineproc.Owned{Name: o.name, Process: p.owned, ReadyWithin: ready, Probe: p.ready,
-		Sockets: func() error { return engineSockets(p) }, SocketWord: networkWord(p), Watch: h.watch,
+		Progress: progress,
+		Sockets:  func() error { return engineSockets(p) }, SocketWord: networkWord(p), Watch: h.watch,
 		Resident: func() bool { return h.resources.PID(o.name) == p.PID() }, Report: h.options.OnError,
 		OnStop: func() { h.dropEngine(p) }, AfterFailedCheck: h.afterFailedCheck}
 }
@@ -454,8 +622,27 @@ func (o *ownedProcess) PID() int { return o.process.PID() }
 // An engine that printed an allocation failure and did not become ready
 // reads EngineDoesNotFit with its remedy (MODELHOST-L9).
 func (o *ownedProcess) Ready(ctx context.Context) error {
+	started := time.Now()
+	if o.process.log != nil {
+		_, logErr := fmt.Fprintf(o.process.log, "%s phase=readiness_begin\n", started.UTC().Format(time.RFC3339Nano))
+		if logErr != nil && o.host.options.OnError != nil {
+			o.host.options.OnError(logErr)
+		}
+	}
 	err := o.kit().Ready(ctx)
+	if o.process.log != nil {
+		_, logErr := fmt.Fprintf(o.process.log, "%s phase=readiness elapsed_ms=%d error=%q\n", time.Now().UTC().Format(time.RFC3339Nano), time.Since(started).Milliseconds(), fmt.Sprint(err))
+		if logErr != nil && o.host.options.OnError != nil {
+			o.host.options.OnError(logErr)
+		}
+	}
 	if err == nil {
+		if o.load != nil {
+			// Ready runs under the holder lock for this exact start. Publish
+			// its first successful readiness only to the load that started it.
+			o.load.readyAt = time.Now()
+			o.load = nil
+		}
 		return nil
 	}
 	if line := o.process.fit.failure(); line != "" {
@@ -490,14 +677,35 @@ func (h *Host) mapFailure(name string, amount int64, err error) error {
 }
 
 func (h *Host) Unload(name, why string) { h.resources.Unload(name, why) }
-func (h *Host) Run(ctx context.Context) { h.resources.Run(ctx) }
+func (h *Host) Run(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); h.contextLoop(ctx) }()
+	rechecked := make(chan struct{})
+	go func() { defer close(rechecked); h.recheckLoop(ctx) }()
+	h.resources.Run(ctx)
+	cancel()
+	<-done
+	<-rechecked
+}
 
 // Close stops the video worker, then every engine, and releases the leases.
 func (h *Host) Close() {
+	h.loadMu.Lock()
+	h.loadClosed = true
+	if h.loadCancel != nil {
+		h.loadCancel()
+	}
+	h.loadMu.Unlock()
+	h.loadWG.Wait()
+	h.closeFacts()
 	if h.video != nil {
 		h.video.close()
 	}
 	h.resources.Close()
+	if h.loadLogClose != nil {
+		h.loadLogClose()
+	}
 }
 func (h *Host) yield(request res.YieldRequest) (res.YieldAnswer, string) {
 	return h.resources.Yield(request)

@@ -16,9 +16,9 @@ import (
 	"github.com/openabstractions/abstraction-identity/listen"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	jobwire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/job"
-	"github.com/openabstractions/abstraction-inference/go/providerhost"
 	acceptance "github.com/openabstractions/abstraction-job/go/abstraction/job/acceptance"
 	"github.com/openabstractions/abstraction-job/go/acceptanceprovider"
+	"github.com/openabstractions/abstraction-provider-kit/go/providerhost"
 	router "github.com/openabstractions/abstraction-router/go"
 
 	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
@@ -30,6 +30,34 @@ import (
 // selected, the provider's video@1 runs the stand-in sd-server, and the
 // executor commits the provider's WebM to the caller (INF-G3, INF-G5).
 func TestVideoJobReachesTheModelHostThroughTheRuntime(t *testing.T) {
+	committed := runVideoJob(t, stagedVideoEngine(t), "fastwan2.2-ti2v-5b", "auto", 1000)
+	if len(committed) != 1 || http.DetectContentType(committed[0]) != "video/webm" {
+		t.Fatalf("committed %d results", len(committed))
+	}
+}
+
+// LTX-2.5's row runs through the same start and registry: the runtime's
+// router host with the entry video:ltx-2.5 selects the model host, which
+// starts the stand-in sd-server with the set's encoder, both VAEs and the
+// upscaler folder, and a five-second clip at the quality preset's
+// 1280x704 aligns to 121 frames, as the engine reports them back.
+func TestLTXVideoJobReachesTheModelHostThroughTheRuntime(t *testing.T) {
+	for _, c := range []struct {
+		size     string
+		duration int64
+	}{{"auto", 1000}, {"1280x704", 5000}} {
+		committed := runVideoJob(t, stagedVideoEngineFor(t, host.LTX25), "ltx-2.5", c.size, c.duration)
+		if len(committed) != 1 || http.DetectContentType(committed[0]) != "video/webm" {
+			t.Fatalf("%s: committed %d results", c.size, len(committed))
+		}
+	}
+}
+
+// runVideoJob runs one video job of model at size and duration through the
+// runtime's job executor and the model host, and returns what was
+// committed to the caller.
+func runVideoJob(t *testing.T, engine host.VideoEngine, model, size string, durationMS int64) [][]byte {
+	t.Helper()
 	if err := identity.CanEver(listen.Program); err != nil || runtime.GOOS == "darwin" {
 		t.Skip("Program proof unavailable")
 	}
@@ -44,9 +72,8 @@ func TestVideoJobReachesTheModelHostThroughTheRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const model = "fastwan2.2-ti2v-5b"
 	modelHost, err := host.New(host.Options{Leases: granting{released: make(chan string, 4)}, Source: oneObject{}, Idle: time.Hour,
-		Video: &host.VideoOptions{Model: model, Engine: stagedVideoEngine(t), Store: content.Store, Poll: 20 * time.Millisecond}})
+		Video: &host.VideoOptions{Model: model, Engine: engine, Store: content.Store, Poll: 20 * time.Millisecond}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,9 +149,9 @@ func TestVideoJobReachesTheModelHostThroughTheRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	image := jobwire.ImageRequest{Mode: jobwire.ModeGenerate, Extensions: map[string]string{}, Model: model, Prompt: "a lighthouse at dusk", Size: "auto", Count: 1,
+	image := jobwire.ImageRequest{Mode: jobwire.ModeGenerate, Extensions: map[string]string{}, Model: model, Prompt: "a lighthouse at dusk", Size: size, Count: 1,
 		Guarantees: []jobwire.RequestGuarantee{jobwire.RequestGuaranteeLocalOnly}}
-	document := &jobwire.Document{Request: &jobwire.Request{Profile: jobwire.ProfileVideo, DurationMs: 1000, Image: image}}
+	document := &jobwire.Document{Request: &jobwire.Request{Profile: jobwire.ProfileVideo, DurationMs: durationMS, Image: image}}
 	submission := acceptance.Submission{Identity: acceptance.RequestIdentity{Key: "video-1", HistoryEpoch: history.HistoryEpoch},
 		Kind: inference.InferenceJobKind, Spec: jobwire.Encode(document), RequiredGuarantees: []string{inference.RecoverableUpstreamGuarantee}}
 	if _, err := jobs.Bind("caller-scope").Submit(submission); err != nil {
@@ -146,7 +173,5 @@ func TestVideoJobReachesTheModelHostThroughTheRuntime(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(committed) != 1 || http.DetectContentType(committed[0]) != "video/webm" {
-		t.Fatalf("committed %d results", len(committed))
-	}
+	return committed
 }

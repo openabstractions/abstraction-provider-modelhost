@@ -61,13 +61,15 @@ type server struct {
 	// generates and keeps serving.
 	lostLineOnly bool
 	lostPrinted  bool
+	// container, when set, is every completed job's result.
+	container []byte
 }
 
 func main() {
 	opts := map[string]string{}
 	var switches []string
 	values := map[string]bool{"--listen-ip": true, "-l": true, "--listen-port": true, "--diffusion-model": true,
-		"--t5xxl": true, "--tae": true, "--max-vram": true, "--backend": true, "-t": true, "--vae-tile-size": true}
+		"--t5xxl": true, "--tae": true, "--llm": true, "--vae": true, "--audio-vae": true, "--hires-upscalers-dir": true, "--max-vram": true, "--backend": true, "-t": true, "--vae-tile-size": true}
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		word := args[i]
@@ -111,7 +113,16 @@ func main() {
 			os.Exit(2)
 		}
 	}
-	for _, flag := range []string{"--diffusion-model", "--t5xxl", "--tae"} {
+	// A Wan set passes --t5xxl and --tae, an LTX set --llm, --vae,
+	// --audio-vae and the upscaler folder; each named one must exist.
+	model := []string{"--diffusion-model", "--t5xxl", "--tae"}
+	if opts["--llm"] != "" {
+		model = []string{"--diffusion-model", "--llm", "--vae", "--audio-vae"}
+		if opts["--hires-upscalers-dir"] != "" {
+			model = append(model, "--hires-upscalers-dir")
+		}
+	}
+	for _, flag := range model {
 		if _, err := os.Stat(opts[flag]); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: no file\n", flag)
 			os.Exit(1)
@@ -131,6 +142,14 @@ func main() {
 		stall: duration(opts["--fake-stall-submit"], 0), crash: opts["--fake-crash-generating"] != "",
 		deviceLost: opts["--fake-device-lost"] != "", echoPrompt: opts["--fake-echo-prompt"] != "",
 		lostLineOnly: opts["--fake-lost-line-only"] != ""}
+	if path := opts["--fake-result-file"]; path != "" {
+		// A recorded container stands for the engine's result.
+		recorded, err := os.ReadFile(path)
+		if err != nil {
+			os.Exit(2)
+		}
+		s.container = recorded
+	}
 	loaded := time.Now().Add(duration(opts["--fake-load"], 0))
 	mode := opts["--fake-mode"]
 	if mode == "" {
@@ -327,6 +346,9 @@ func (s *server) view(j *job) map[string]any {
 	switch j.Status {
 	case "completed":
 		data, mime, frames, fps := webm, "video/webm", j.Frames, j.FPS
+		if s.container != nil {
+			data = s.container
+		}
 		switch s.result {
 		case "frames":
 			frames++

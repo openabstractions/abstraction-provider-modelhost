@@ -16,13 +16,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	identity "github.com/openabstractions/abstraction-identity"
 	"github.com/openabstractions/abstraction-identity/listen"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
 	"github.com/openabstractions/abstraction-inference/go/mediationcontent"
-	"github.com/openabstractions/abstraction-inference/go/providerhost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-provider-kit/go/providerhost"
 	router "github.com/openabstractions/abstraction-router/go"
 
 	"github.com/openabstractions/abstraction-provider-modelhost/go/host"
@@ -45,6 +45,19 @@ func requireSocketOwnerTables(t *testing.T) {
 // stagedVideoEngine builds the stand-in sd-server under a pin of its own
 // folder and places a three-file model set where it was downloaded.
 func stagedVideoEngine(t *testing.T) host.VideoEngine {
+	t.Helper()
+	set := host.VideoModelSet{Name: "fastwan2.2-ti2v-5b", Preset: host.FastWanPreset, Sizes: host.FastWan22TI2V5B.Sizes,
+		MaxFrames: 121, MaxFPS: 30, FirstFrame: host.FirstFrameOptional}
+	for _, f := range []struct{ name, role string }{{"d.gguf", host.RoleDiffusionModel}, {"e.gguf", host.RoleT5XXL}, {"t.safetensors", host.RoleTAE}} {
+		set.Files = append(set.Files, host.VideoModelFile{Name: f.name, Role: f.role})
+	}
+	return stagedVideoEngineFor(t, set)
+}
+
+// stagedVideoEngineFor stages the stand-in sd-server and a stand-in file
+// for each of set's files, under its name and role, pinned by the stand-in's
+// size and digest; the rest of the set's row is kept.
+func stagedVideoEngineFor(t *testing.T, set host.VideoModelSet) host.VideoEngine {
 	t.Helper()
 	// Placed model paths follow no symbolic link (INF-F7); macOS's
 	// temporary folder is under one.
@@ -69,14 +82,15 @@ func stagedVideoEngine(t *testing.T) host.VideoEngine {
 	}
 	sum := sha256.Sum256(raw)
 	pin := host.EnginePin{Release: "test", Program: filepath.Base(program),
-		Files: []enginefiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
+		Files: []programfiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
 	source := filepath.Join(root, "downloads")
 	if err := os.MkdirAll(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	set := host.VideoModelSet{Name: "fastwan2.2-ti2v-5b", Preset: host.FastWanPreset, Sizes: host.FastWan22TI2V5B.Sizes,
-		MaxFrames: 121, MaxFPS: 30, FirstFrame: host.FirstFrameOptional}
-	for _, f := range []struct{ name, role string }{{"d.gguf", host.RoleDiffusionModel}, {"e.gguf", host.RoleT5XXL}, {"t.safetensors", host.RoleTAE}} {
+	pinned := set.Files
+	set.Files = nil
+	for _, p := range pinned {
+		f := struct{ name, role string }{p.Name, p.Role}
 		data := []byte("weights " + f.name)
 		if err := os.WriteFile(filepath.Join(source, f.name), data, 0o600); err != nil {
 			t.Fatal(err)
@@ -91,7 +105,7 @@ func stagedVideoEngine(t *testing.T) host.VideoEngine {
 		set.Files = append(set.Files, file)
 	}
 	state := filepath.Join(root, "state")
-	files := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	files := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	places := host.VideoModelPlaces(state, set)
 	if _, err := host.PlaceVideoModels(context.Background(), set, []host.ModelSearch{host.FolderSearch(source)}, places); err != nil {
 		t.Fatal(err)

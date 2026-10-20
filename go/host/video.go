@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
+	digestfmt "github.com/openabstractions/abstraction-storage/go/digest"
 	"io"
 	"net/http"
 	"strings"
@@ -14,7 +14,7 @@ import (
 	"time"
 
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	"github.com/openabstractions/abstraction-provider-kit/go/videoops"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	"github.com/openabstractions/abstraction-resource/go/holder"
@@ -139,7 +139,7 @@ type sdKind struct{ v *videoHost }
 func (k sdKind) Bounds() videoBounds {
 	s := k.v.opts.Engine.Set
 	return videoBounds{Width: s.Preset.Width, Height: s.Preset.Height, FPS: s.Preset.FPS, Sizes: s.Sizes,
-		MaxFrames: s.MaxFrames, MaxFPS: s.MaxFPS, FirstFrame: s.FirstFrame}
+		MaxFrames: s.MaxFrames, MaxFPS: s.MaxFPS, FirstFrame: s.FirstFrame, FrameStep: s.FrameStep}
 }
 
 // admit builds the body once, so a request the engine would refuse is
@@ -361,18 +361,45 @@ func (v *videoHost) complete(op *videoOp, params sdcpp.VideoParams, result *sdcp
 		v.Finish(op, wire.VideoStateFailed, videoEngineResult, nil)
 		return
 	}
+	if v.opts.Engine.Set.Preset.OutputFormat == sdcpp.FormatWebM {
+		data = v.playableSound(data)
+	}
 	media := http.DetectContentType(data)
 	if format := v.opts.Engine.Set.Preset.OutputFormat; media != sdcpp.FormatMIME(format) && !(media == "video/avi" && format == sdcpp.FormatAVI) {
 		v.Finish(op, wire.VideoStateFailed, videoEngineResult, nil)
 		return
 	}
 	sum := sha256.Sum256(data)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
+	digest := digestfmt.Hex(sum[:])
 	if err := v.Keep(digest, data); err != nil {
 		v.Finish(op, wire.VideoStateFailed, "content:unavailable", nil)
 		return
 	}
 	v.Finish(op, wire.VideoStateCompleted, "", &wire.Delivery{Digest: digest, MediaType: media, Size: int64(len(data)), Location: "local"})
+}
+
+// playableSound answers the clip with its PCM sound encoded as Vorbis, which
+// WebM players play; sd-server writes PCM, which the WebM format does not
+// list and Media Foundation refuses. A clip that cannot be re-encoded is
+// delivered as the engine wrote it, and the log says why.
+func (v *videoHost) playableSound(data []byte) []byte {
+	out, sound, err := sdcpp.VorbisSound(data)
+	logger := v.host.loadLogger
+	switch {
+	case err == nil:
+		if logger != nil {
+			logger.Info("video sound", "model", v.opts.Model, "codec", "vorbis", "channels", sound.Channels,
+				"rate", sound.Rate, "seconds", fmt.Sprintf("%.2f", sound.Seconds()))
+		}
+		return out
+	case errors.Is(err, sdcpp.ErrNoSound):
+		if logger != nil {
+			logger.Info("video sound", "model", v.opts.Model, "result", "the engine wrote no audio track")
+		}
+	case logger != nil:
+		logger.Warn("video sound", "model", v.opts.Model, "result", "kept as the engine wrote it", "error", err.Error())
+	}
+	return data
 }
 
 // stopJob carries out a cancel: the engine's cancel route while it holds the
@@ -408,7 +435,7 @@ func (v *videoHost) stopJob(base, job, state string) {
 func (h *Host) ensureVideo(ctx context.Context) (string, error) {
 	v := h.video
 	engine := v.opts.Engine
-	amount := engine.Set.Size()
+	amount := engine.Set.LeaseBytes()
 	err := h.resources.Ensure(ctx, v.opts.Model, func() (holder.Component, error) {
 		if err := engine.present(ctx); err != nil {
 			return holder.Component{}, refuse(NoEngine, "%v", err)

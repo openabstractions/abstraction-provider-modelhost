@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,8 +15,52 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
+	"github.com/openabstractions/abstraction-identity/fileid"
+	"github.com/openabstractions/abstraction-identity/go/privatedir"
 )
+
+func TestRuntimeReleaseInputMatchesProviderPin(t *testing.T) {
+	data, err := os.ReadFile(privateInput(t, "..", "..", "..", "..", "monitor", "internal", "setup", "vc_runtime_asset.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asset struct {
+		Runtime struct {
+			Name, Version, Folder string
+			Files                 []struct {
+				Path   string `json:"path"`
+				Size   int64  `json:"size_bytes"`
+				SHA256 string `json:"sha256"`
+			}
+		}
+	}
+	if err := json.Unmarshal(data, &asset); err != nil {
+		t.Fatal(err)
+	}
+	pin := LlamaCppB10825WindowsVulkan.Runtime
+	if asset.Runtime.Name != pin.Name || asset.Runtime.Version != pin.Version || asset.Runtime.Folder != pin.Folder || len(asset.Runtime.Files) != len(pin.Files) {
+		t.Fatal("runtime release input differs from the provider pin")
+	}
+	for index, file := range pin.Files {
+		got := asset.Runtime.Files[index]
+		if got.Path != file.Path || got.Size != file.Size || got.SHA256 != file.SHA256 {
+			t.Fatalf("runtime release member %s differs from the provider pin", file.Path)
+		}
+	}
+}
+
+func TestBareContentDigestGrammar(t *testing.T) {
+	good := strings.Repeat("a", 64)
+	for _, value := range []string{good, "", good[:63], good + "a", strings.ToUpper(good), strings.Repeat("g", 64), "sha256:" + good, " " + good} {
+		pin := EnginePin{Release: "test", Program: "engine.exe", Files: []programfiles.File{{Path: "engine.exe", Size: 1, SHA256: good}}}
+		pin.Bundle.Name, pin.Bundle.Size, pin.Bundle.SHA256 = "bundle.zip", 1, value
+		err := pin.valid()
+		if (err == nil) != (value == good) {
+			t.Fatalf("bundle content digest %q: %v", value, err)
+		}
+	}
+}
 
 // VISION 2026-10-01: this provider launches only the pinned llama.cpp
 // release. An engine path outside the pin is refused with engine:none before
@@ -172,7 +217,7 @@ func TestThePinnedReleaseIsTheReviewedB10825(t *testing.T) {
 	if err != nil {
 		t.Skipf("review not in this tree: %v", err)
 	}
-	for _, f := range append(pin.Files, enginefiles.File{Path: pin.Archive, SHA256: pin.ArchiveSHA256}) {
+	for _, f := range append(pin.Files, programfiles.File{Path: pin.Archive, SHA256: pin.ArchiveSHA256}) {
 		if !bytes.Contains(review, []byte(f.SHA256)) {
 			t.Fatalf("%s %s is not the review's digest", f.Path, f.SHA256)
 		}
@@ -265,7 +310,7 @@ func testArchive(t *testing.T, entries map[string]string, keep ...string) (strin
 			continue
 		}
 		digest := sha256.Sum256([]byte(entries[name]))
-		pin.Files = append(pin.Files, enginefiles.File{Path: name, Size: int64(len(entries[name])), SHA256: hex.EncodeToString(digest[:])})
+		pin.Files = append(pin.Files, programfiles.File{Path: name, Size: int64(len(entries[name])), SHA256: hex.EncodeToString(digest[:])})
 	}
 	return path, pin
 }
@@ -320,6 +365,19 @@ func folderNames(t *testing.T, dir string) []string {
 	return names
 }
 
+func testRecordState(t *testing.T, root string) string {
+	t.Helper()
+	folder, err := fileid.Resolve(context.Background(), fileid.Self, root, fileid.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(folder.Path(), "state")
+	if err := privatedir.Make(state); err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
 var testEntries = map[string]string{"llama-server.exe": "server", "ggml.dll": "library", "llama-cli.exe": "tool"}
 
 // Install stages the kept entries of the pinned archive and nothing else,
@@ -327,8 +385,8 @@ var testEntries = map[string]string{"llama-server.exe": "server", "ggml.dll": "l
 func TestInstallEngineStagesOnlyThePinnedFiles(t *testing.T) {
 	archive, pin := testArchive(t, testEntries, "llama-server.exe", "ggml.dll")
 	dir := filepath.Join(t.TempDir(), "engine")
-	record := filepath.Join(t.TempDir(), "state", "engine.files")
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	record := filepath.Join(testRecordState(t, t.TempDir()), "engine.files")
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	program, err := InstallEngine(context.Background(), v, pin, archive, dir, record)
 	if err != nil {
 		t.Fatal(err)
@@ -353,7 +411,7 @@ func TestInstallBundledEngineProvesInputEvenWhenFolderAlreadyMatches(t *testing.
 	bundle := testBundle(t, &pin, testBundleFiles()...)
 	dir := filepath.Join(t.TempDir(), "engine")
 	record := filepath.Join(t.TempDir(), "state", "engine.files")
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	program, err := InstallBundledEngine(context.Background(), v, pin, bundle, dir, record)
 	if err != nil {
 		t.Fatal(err)
@@ -379,6 +437,42 @@ func TestInstallBundledEngineProvesInputEvenWhenFolderAlreadyMatches(t *testing.
 	}
 }
 
+// A folder staged from the pin before the app-local runtime (the 24-file
+// engine of 0.4.0 and the 1101b previews) no longer proves against the pin
+// that carries it; installing the new bundle restages it and the engine then
+// proves (review B2: without Replace the kit refused the full folder).
+func TestInstallBundledEngineRestagesAFolderFromTheEarlierPin(t *testing.T) {
+	_, old := testArchive(t, testEntries, "llama-server.exe", "ggml.dll")
+	oldBundle := testBundle(t, &old, testBundleFiles()...)
+	dir := filepath.Join(t.TempDir(), "engine")
+	record := filepath.Join(t.TempDir(), "state", "engine.files")
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
+	if _, err := InstallBundledEngine(context.Background(), v, old, oldBundle, dir, record); err != nil {
+		t.Fatal(err)
+	}
+	updated := old
+	runtimeBody := "runtime"
+	digest := sha256.Sum256([]byte(runtimeBody))
+	updated.Runtime = EngineRuntime{Name: "Microsoft Visual C++ 2015-2026 Redistributable (x64)", Version: "14.51.36231",
+		Folder: "Microsoft.VC145.CRT", Files: []programfiles.File{{Path: "vcruntime140.dll", Size: int64(len(runtimeBody)), SHA256: hex.EncodeToString(digest[:])}}}
+	newBundle := testBundle(t, &updated, append(testBundleFiles(), bundleEntry{"vcruntime140.dll", runtimeBody, 0o644})...)
+	e := Engine{Program: filepath.Join(dir, updated.Program), Pin: updated, Record: record, Files: v}
+	if err := e.present(context.Background()); err == nil {
+		t.Fatal("the earlier pin's folder proved against the pin with the runtime")
+	}
+	program, err := InstallBundledEngine(context.Background(), v, updated, newBundle, dir, record)
+	if err != nil {
+		t.Fatalf("restaging the earlier pin's folder: %v", err)
+	}
+	if got := strings.Join(folderNames(t, dir), ","); got != "ggml.dll,llama-server.exe,vcruntime140.dll" {
+		t.Fatalf("staged %s", got)
+	}
+	e.Program = program
+	if err := e.present(context.Background()); err != nil {
+		t.Fatalf("the restaged folder: %v", err)
+	}
+}
+
 func TestInstallBundledEngineRefusesNonExactMembers(t *testing.T) {
 	cases := map[string][]bundleEntry{
 		"directory":      append(testBundleFiles(), bundleEntry{"unused/", "", os.ModeDir | 0o755}),
@@ -392,7 +486,7 @@ func TestInstallBundledEngineRefusesNonExactMembers(t *testing.T) {
 			bundle := testBundle(t, &pin, entries...)
 			dir := filepath.Join(t.TempDir(), "engine")
 			record := filepath.Join(t.TempDir(), "engine.files")
-			v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+			v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 			if _, err := InstallBundledEngine(context.Background(), v, pin, bundle, dir, record); err == nil {
 				t.Fatal("non-exact bundle was installed")
 			}
@@ -407,7 +501,7 @@ func TestBundledEnginePinNamesOnlyABasename(t *testing.T) {
 	_, pin := testArchive(t, testEntries, "llama-server.exe", "ggml.dll")
 	bundle := testBundle(t, &pin, testBundleFiles()...)
 	pin.Bundle.Name = "../bundle.zip"
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	if _, err := InstallBundledEngine(context.Background(), v, pin, bundle,
 		filepath.Join(t.TempDir(), "engine"), filepath.Join(t.TempDir(), "engine.files")); err == nil ||
 		!strings.Contains(err.Error(), "one basename") {
@@ -419,7 +513,7 @@ func TestBundledEnginePinNamesOnlyABasename(t *testing.T) {
 // anything, and an entry whose bytes differ from the pin, and leaves nothing
 // of its own behind.
 func TestInstallEngineRefusesAnythingOutsideThePin(t *testing.T) {
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	record := filepath.Join(t.TempDir(), "engine.files")
 	t.Run("another archive", func(t *testing.T) {
 		archive, pin := testArchive(t, testEntries, "llama-server.exe", "ggml.dll")
@@ -471,8 +565,8 @@ func TestCheckEngineRefusesAnUnpinnedProgram(t *testing.T) {
 func TestRecordedEngineNamesOnlyTheInstalledFolder(t *testing.T) {
 	archive, pin := testArchive(t, testEntries, "llama-server.exe", "ggml.dll")
 	dir := filepath.Join(t.TempDir(), "engine")
-	record := filepath.Join(t.TempDir(), "engine.files")
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	record := filepath.Join(testRecordState(t, t.TempDir()), "engine.files")
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	if _, err := InstallEngine(context.Background(), v, pin, archive, dir, record); err != nil {
 		t.Fatal(err)
 	}
@@ -494,15 +588,44 @@ func TestInstallTheReviewedArchive(t *testing.T) {
 	if archive == "" {
 		t.Skip("OA_LLAMA_B10825_ZIP names no copy of llama-b10825-bin-win-vulkan-x64.zip")
 	}
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
 	dir := filepath.Join(t.TempDir(), "llama.cpp-b10825")
 	record := EngineRecord(t.TempDir(), LlamaCppB10825WindowsVulkan)
-	program, err := InstallEngine(context.Background(), v, LlamaCppB10825WindowsVulkan, archive, dir, record)
+	// The publisher's ZIP lacks the app-local Visual C++ runtime the pin
+	// requires; the reviewed archive is refused before anything is staged.
+	if _, err := InstallEngine(context.Background(), v, LlamaCppB10825WindowsVulkan, archive, dir, record); err == nil ||
+		!strings.Contains(err.Error(), "lacks the Microsoft Visual C++") {
+		t.Fatalf("install from the publisher archive = %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("a refused archive left %s: %v", dir, err)
+	}
+}
+
+// OA_LLAMA_B10825_BUNDLE names the deterministic reduced ZIP derived from the
+// reviewed publisher archive. This installs its exact 27-file manifest (24 publisher files and the
+// app-local Visual C++ runtime) without
+// starting llama-server or any other executable.
+func TestInstallTheReviewedBundle(t *testing.T) {
+	bundle := os.Getenv("OA_LLAMA_B10825_BUNDLE")
+	if bundle == "" {
+		t.Skip("OA_LLAMA_B10825_BUNDLE names no reduced b10825 package ZIP")
+	}
+	v := programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})
+	dir := filepath.Join(t.TempDir(), "llama.cpp-b10825")
+	record := EngineRecord(t.TempDir(), LlamaCppB10825WindowsVulkan)
+	program, err := InstallBundledEngine(context.Background(), v, LlamaCppB10825WindowsVulkan, bundle, dir, record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(folderNames(t, dir)); n != len(LlamaCppB10825WindowsVulkan.Files) {
-		t.Fatalf("staged %d files, wanted %d", n, len(LlamaCppB10825WindowsVulkan.Files))
+	want := len(LlamaCppB10825WindowsVulkan.Files) + len(LlamaCppB10825WindowsVulkan.Runtime.Files)
+	if n := len(folderNames(t, dir)); n != want {
+		t.Fatalf("staged %d files, wanted %d", n, want)
+	}
+	for _, f := range LlamaCppB10825WindowsVulkan.Runtime.Files {
+		if _, err := os.Stat(filepath.Join(dir, f.Path)); err != nil {
+			t.Fatalf("the runtime file %s is not beside the engine: %v", f.Path, err)
+		}
 	}
 	e := Engine{Program: program, Pin: LlamaCppB10825WindowsVulkan, Record: record, Files: v}
 	if err := e.present(context.Background()); err != nil {
@@ -510,26 +633,37 @@ func TestInstallTheReviewedArchive(t *testing.T) {
 	}
 }
 
-// OA_LLAMA_B10825_BUNDLE names the deterministic reduced ZIP derived from the
-// reviewed publisher archive. This installs its exact 24-file manifest without
-// starting llama-server or any other executable.
-func TestInstallTheReviewedBundle(t *testing.T) {
-	bundle := os.Getenv("OA_LLAMA_B10825_BUNDLE")
-	if bundle == "" {
-		t.Skip("OA_LLAMA_B10825_BUNDLE names no reduced b10825 package ZIP")
+// A clean Windows has no Visual C++ runtime (llama-server exited 0xC0000135
+// in Windows Sandbox). The pin carries the runtime files the publisher's
+// imports name, app-locally: the engine folder holds them beside the kept
+// files, the bundle proof requires them, and the published pin names them.
+func TestThePinCarriesTheVisualCppRuntimeAppLocally(t *testing.T) {
+	pin := LlamaCppB10825WindowsVulkan
+	names := map[string]bool{}
+	for _, f := range pin.Runtime.Files {
+		names[f.Path] = true
+		if kept(pin, f.Path) {
+			t.Fatalf("%s is both a publisher file and a runtime file", f.Path)
+		}
 	}
-	v := enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})
-	dir := filepath.Join(t.TempDir(), "llama.cpp-b10825")
-	record := EngineRecord(t.TempDir(), LlamaCppB10825WindowsVulkan)
-	program, err := InstallBundledEngine(context.Background(), v, LlamaCppB10825WindowsVulkan, bundle, dir, record)
-	if err != nil {
-		t.Fatal(err)
+	if len(names) != 3 || !names["vcruntime140.dll"] || !names["vcruntime140_1.dll"] || !names["msvcp140.dll"] ||
+		pin.Runtime.Version == "" || pin.Runtime.Folder != "Microsoft.VC145.CRT" {
+		t.Fatalf("runtime pin %+v", pin.Runtime)
 	}
-	if n := len(folderNames(t, dir)); n != len(LlamaCppB10825WindowsVulkan.Files) {
-		t.Fatalf("staged %d files, wanted %d", n, len(LlamaCppB10825WindowsVulkan.Files))
+	folder := map[string]bool{}
+	for _, f := range pin.manifest().Files {
+		folder[f.Path] = true
 	}
-	e := Engine{Program: program, Pin: LlamaCppB10825WindowsVulkan, Record: record, Files: v}
-	if err := e.present(context.Background()); err != nil {
-		t.Fatal(err)
+	if len(folder) != len(pin.Files)+len(pin.Runtime.Files) || !folder["vcruntime140.dll"] {
+		t.Fatalf("the engine folder manifest has %d files", len(folder))
+	}
+	info := pin.Info()
+	if len(info.Files) != len(folder) || len(info.Runtime.Files) != 3 || info.Runtime.Folder != pin.Runtime.Folder {
+		t.Fatalf("published pin %+v", info.Runtime)
+	}
+	broken := pin
+	broken.Runtime.Name = ""
+	if err := broken.valid(); err == nil {
+		t.Fatal("a runtime with no redistributable name is valid")
 	}
 }

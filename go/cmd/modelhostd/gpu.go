@@ -4,7 +4,6 @@ import (
 	"io"
 	"log/slog"
 
-	logging "github.com/openabstractions/abstraction-logging/go"
 	"github.com/openabstractions/abstraction-provider-kit/go/quarantine"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	"github.com/openabstractions/abstraction-resource/go/holder"
@@ -17,9 +16,9 @@ const gpuQuarantineFile = gpufault.QuarantineFile
 // RES-G1..RES-G7, MODELHOST-G1): the resource kit's provider composition
 // (gpufault.ForProvider) with the wake lease through leases@1 and OA
 // logging.
-func newGPUGuard(state string, leases holder.Leases, stderr io.Writer, report func(error)) (*gpufault.Guard, error) {
+func newGPUGuard(state string, leases holder.Leases, stderr io.Writer, report func(error), logger *slog.Logger) (*gpufault.Guard, error) {
 	return gpufault.ForProvider(gpufault.ProviderOptions{Name: "modelhostd", State: state,
-		Wake: gpufault.LeaseWake(leases, 0, report), Logger: slog.New(logging.LegacyDefault("modelhostd")),
+		Wake: gpufault.LeaseWake(leases, 0, report), Logger: logger,
 		Stderr: stderr, Report: report})
 }
 

@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	identity "github.com/openabstractions/abstraction-identity"
 	"github.com/openabstractions/abstraction-identity/listen"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
 	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	router "github.com/openabstractions/abstraction-router/go"
@@ -40,6 +40,10 @@ func (g granting) Renew(string) (res.LeaseChange, error) { return res.LeaseChang
 func (g granting) BindProcess(string, int) (res.ProcessBindResult, error) {
 	return res.ProcessBindResult{Outcome: res.ProcessBindOutcomeBound}, nil
 }
+func (granting) Label(string, string) (res.LeaseChange, error) {
+	return res.LeaseChange{Applied: true}, nil
+}
+
 func (g granting) Release(lease string) (res.LeaseChange, error) {
 	select {
 	case g.released <- lease:
@@ -84,14 +88,15 @@ func endpointFor(t *testing.T) string {
 	return filepath.Join(dir, "s")
 }
 
-func buildFakeEngine(t *testing.T) string {
+func buildFakeEngine(t *testing.T, buildOptions ...string) string {
 	t.Helper()
 	name := "fakeengine"
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
 	target := filepath.Join(t.TempDir(), name)
-	build := exec.Command("go", "build", "-o", target, "../host/testdata/fakeengine")
+	args := append([]string{"build"}, buildOptions...)
+	build := exec.Command("go", append(args, "-o", target, "../host/testdata/fakeengine")...)
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build fakeengine: %v\n%s", err, out)
 	}
@@ -102,8 +107,8 @@ func buildFakeEngine(t *testing.T) string {
 // their temporary folders.
 type openACL struct{}
 
-func (openACL) Restrict([]string) error                 { return nil }
-func (openACL) Check(string, *enginefiles.Handle) error { return nil }
+func (openACL) Restrict([]string) error                  { return nil }
+func (openACL) Check(string, *programfiles.Handle) error { return nil }
 
 // pinnedEngine is the stand-in engine under a pin of its own folder, which
 // holds the program alone. An empty program configures no engine.
@@ -115,7 +120,7 @@ func pinnedEngine(t *testing.T, program string) host.Engine {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockets) })
 	e := host.Engine{Program: program, Ready: 30 * time.Second, Record: filepath.Join(t.TempDir(), "engine.files"),
-		Sockets: filepath.Join(sockets, "s"), Files: enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})}
+		Sockets: filepath.Join(sockets, "s"), Files: programfiles.NewVerifier(programfiles.Options{ACL: openACL{}})}
 	if program == "" {
 		return e
 	}
@@ -125,7 +130,7 @@ func pinnedEngine(t *testing.T, program string) host.Engine {
 	}
 	sum := sha256.Sum256(raw)
 	e.Pin = host.EnginePin{Release: "test", Program: filepath.Base(program),
-		Files: []enginefiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
+		Files: []programfiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
 	return e
 }
 
@@ -147,7 +152,7 @@ func serveForProgram(t *testing.T, engine, runtimeProgram string) (*wire.ChatCli
 
 // serveTransport composes the provider as serve does and returns the
 // transport to its endpoint, for any of the services it serves.
-func serveTransport(t *testing.T, engine, runtimeProgram string) (listen.FrameClient, *host.Host) {
+func serveTransport(t *testing.T, engine, runtimeProgram string, configure ...func(*host.Options)) (listen.FrameClient, *host.Host) {
 	t.Helper()
 	if err := identity.CanEver(listen.Program); err != nil || runtime.GOOS == "darwin" {
 		t.Skip("Program proof unavailable")
@@ -157,7 +162,7 @@ func serveTransport(t *testing.T, engine, runtimeProgram string) (listen.FrameCl
 		t.Fatal(err)
 	}
 	var provider *inference.Provider
-	model, err := host.New(host.Options{
+	options := host.Options{
 		Models: []host.Model{{Name: "tiny:1b", Store: "fake", Object: "tiny"}},
 		Engine: pinnedEngine(t, engine),
 		Source: oneObject{object: host.Object{Store: "fake", ID: "tiny", Path: weights, File: "model.gguf", Size: 2048}},
@@ -169,7 +174,11 @@ func serveTransport(t *testing.T, engine, runtimeProgram string) (listen.FrameCl
 			}
 			return provider.ActiveForModel(name)
 		},
-	})
+	}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	model, err := host.New(options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,9 +239,6 @@ func TestChatLoadsTheModelAndMediatesToTheEngine(t *testing.T) {
 	if err != nil || admission.Outcome != wire.StartOutcomeAccepted {
 		t.Fatalf("start %+v %v", admission, err)
 	}
-	if !model.Loaded("tiny:1b") {
-		t.Fatalf("after the call the host does not hold %q", "tiny:1b")
-	}
 	var text strings.Builder
 	cursor := int64(0)
 	for i := 0; i < 50; i++ {
@@ -252,6 +258,9 @@ func TestChatLoadsTheModelAndMediatesToTheEngine(t *testing.T) {
 	}
 	if !strings.Contains(text.String(), "hosted by tiny:1b") {
 		t.Fatalf("the engine's answer read %q", text.String())
+	}
+	if !model.Loaded("tiny:1b") {
+		t.Fatalf("after accepted execution the host does not hold %q", "tiny:1b")
 	}
 	t.Logf("chat@1 answered %q with lease %s", text.String(), model.Lease("tiny:1b"))
 }

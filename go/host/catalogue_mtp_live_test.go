@@ -60,7 +60,7 @@ func TestLiveCatalogueMTPChat(t *testing.T) {
 		t.Fatal("no pinned engine for this platform")
 	}
 	var provider *inference.Provider
-	h, err := New(Options{
+	h, err := newTestHost(Options{
 		Models: []Model{{Name: name, Store: "live", Object: "mtp"}},
 		Engine: Engine{Program: program, Pin: pin, Record: EngineRecord(state, pin),
 			Arguments: []string{"--ctx-size", "32768", "--ubatch-size", "512", "--parallel", "1",
