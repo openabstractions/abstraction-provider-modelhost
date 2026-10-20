@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +19,8 @@ import (
 	"github.com/openabstractions/abstraction-identity/listen"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
+	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	bridge "github.com/openabstractions/abstraction-provider-modelbridge/go/bridge"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	router "github.com/openabstractions/abstraction-router/go"
 
@@ -57,11 +62,11 @@ func (g granting) Answer(context.Context, string, res.YieldAnswer, string) (res.
 
 type oneObject struct{ object host.Object }
 
-func (o oneObject) Resolve(store, id string) (host.Object, bool) {
+func (o oneObject) Resolve(store, id string, _ bridge.Accepts) (host.Object, error) {
 	if store == o.object.Store && id == o.object.ID {
-		return o.object, true
+		return o.object, nil
 	}
-	return host.Object{}, false
+	return host.Object{}, fmt.Errorf("no object %s/%s", store, id)
 }
 func (o oneObject) Stores() []string   { return []string{o.object.Store} }
 func (o oneObject) Root(string) string { return "" }
@@ -93,6 +98,37 @@ func buildFakeEngine(t *testing.T) string {
 	return target
 }
 
+// openACL stands in for the read-only folder ACL, which tests do not set on
+// their temporary folders.
+type openACL struct{}
+
+func (openACL) Restrict([]string) error                 { return nil }
+func (openACL) Check(string, *enginefiles.Handle) error { return nil }
+
+// pinnedEngine is the stand-in engine under a pin of its own folder, which
+// holds the program alone. An empty program configures no engine.
+func pinnedEngine(t *testing.T, program string) host.Engine {
+	t.Helper()
+	sockets, err := os.MkdirTemp("", "oa-ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockets) })
+	e := host.Engine{Program: program, Ready: 30 * time.Second, Record: filepath.Join(t.TempDir(), "engine.files"),
+		Sockets: filepath.Join(sockets, "s"), Files: enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}})}
+	if program == "" {
+		return e
+	}
+	raw, err := os.ReadFile(program)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	e.Pin = host.EnginePin{Release: "test", Program: filepath.Base(program),
+		Files: []enginefiles.File{{Path: filepath.Base(program), Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])}}}
+	return e
+}
+
 // serve composes the whole provider — the model host, the inference provider
 // over the engine's address, and the endpoint — and returns a chat@1 client.
 func serve(t *testing.T, engine string) (*wire.ChatClient, *host.Host) {
@@ -105,6 +141,14 @@ func serve(t *testing.T, engine string) (*wire.ChatClient, *host.Host) {
 
 func serveForProgram(t *testing.T, engine, runtimeProgram string) (*wire.ChatClient, *host.Host) {
 	t.Helper()
+	transport, model := serveTransport(t, engine, runtimeProgram)
+	return wire.NewChatClient(transport), model
+}
+
+// serveTransport composes the provider as serve does and returns the
+// transport to its endpoint, for any of the services it serves.
+func serveTransport(t *testing.T, engine, runtimeProgram string) (listen.FrameClient, *host.Host) {
+	t.Helper()
 	if err := identity.CanEver(listen.Program); err != nil || runtime.GOOS == "darwin" {
 		t.Skip("Program proof unavailable")
 	}
@@ -115,7 +159,7 @@ func serveForProgram(t *testing.T, engine, runtimeProgram string) (*wire.ChatCli
 	var provider *inference.Provider
 	model, err := host.New(host.Options{
 		Models: []host.Model{{Name: "tiny:1b", Store: "fake", Object: "tiny"}},
-		Engine: host.Engine{Program: engine, Ready: 30 * time.Second},
+		Engine: pinnedEngine(t, engine),
 		Source: oneObject{object: host.Object{Store: "fake", ID: "tiny", Path: weights, File: "model.gguf", Size: 2048}},
 		Leases: granting{released: make(chan string, 4)},
 		Idle:   time.Hour,
@@ -132,13 +176,9 @@ func serveForProgram(t *testing.T, engine, runtimeProgram string) (*wire.ChatCli
 	t.Cleanup(model.Close)
 	r := router.New()
 	r.SetHosts(router.OpenAICompatible("modelhost-engine", model.Base("tiny:1b"), "/v1", model.Models()))
-	provider, err = inference.New(inference.Config{Router: r,
-		Decide: func(context.Context, inference.Subject, string, string) (string, error) { return "permitted", nil },
-		Apply: func(context.Context, inference.Subject, string, string, string) (map[string]string, string) {
-			return nil, "applied"
-		},
-		Admit: Admit(model),
-		HTTP:  &http.Client{}, Idle: 10 * time.Second})
+	config := ProviderConfig(model, r, nil)
+	config.Idle = 10 * time.Second
+	provider, err = inference.New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +191,7 @@ func serveForProgram(t *testing.T, engine, runtimeProgram string) (*wire.ChatCli
 	done := make(chan error, 1)
 	go func() { done <- served.Serve(ctx) }()
 	t.Cleanup(func() { cancel(); <-done; provider.Close() })
-	transport := listen.FrameClient{Endpoint: endpoint}.WithDefaults(35*time.Second, MaxFrameBytes)
-	return wire.NewChatClient(transport), model
+	return listen.FrameClient{Endpoint: endpoint}.WithDefaults(35*time.Second, MaxFrameBytes), model
 }
 
 func TestSameAccountOtherProgramCannotCallModelHost(t *testing.T) {
@@ -180,6 +219,9 @@ func chat() wire.Request {
 // One chat@1 call loads the model and reads the engine's answer back through
 // the contract. The load happened inside the call that needed it.
 func TestChatLoadsTheModelAndMediatesToTheEngine(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the model host confirms its engine's listener through abstraction-identity's socket owner tables, which only Windows has; elsewhere every load is refused (MODELHOST-L7)")
+	}
 	client, model := serve(t, buildFakeEngine(t))
 	if model.Loaded("tiny:1b") {
 		t.Fatal("a model was loaded before any call arrived")
@@ -212,6 +254,45 @@ func TestChatLoadsTheModelAndMediatesToTheEngine(t *testing.T) {
 		t.Fatalf("the engine's answer read %q", text.String())
 	}
 	t.Logf("chat@1 answered %q with lease %s", text.String(), model.Lease("tiny:1b"))
+}
+
+// chat@1 carries an image only as a content digest, and this provider
+// resolves none, so an image part is refused at preflight: no lease is taken
+// and no engine starts (b10825 review condition 6, MODELHOST-L8).
+func TestAnImagePartIsRefusedBeforeAnyEngine(t *testing.T) {
+	client, model := serve(t, buildFakeEngine(t))
+	request := chat()
+	request.Messages[0].Parts = append(request.Messages[0].Parts, wire.Part{Kind: wire.PartKindImage,
+		Digest: "sha256:" + strings.Repeat("0", 64), MediaType: "image/png"})
+	admission, err := client.Start(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admission.Outcome != wire.StartOutcomeUnavailable || admission.Reason != "content:unavailable" {
+		t.Fatalf("start %+v, wanted unavailable with reason content:unavailable", admission)
+	}
+	if model.Loaded("tiny:1b") {
+		t.Fatal("an image request loaded the model")
+	}
+}
+
+// The configuration modelhostd serves reaches its engines through the media
+// guard: a body naming a remote image never leaves the process.
+func TestTheServedConfigurationGuardsTheEngine(t *testing.T) {
+	reached := 0
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { reached++ }))
+	defer engine.Close()
+	var reported []error
+	config := ProviderConfig(nil, router.New(), func(err error) { reported = append(reported, err) })
+	body := `{"model":"tiny:1b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://10.0.0.1/a.png"}}]}]}`
+	resp, err := config.HTTP.Post(engine.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || reached != 0 || len(reported) != 1 {
+		t.Fatalf("status %d, engine reached %d times, %d refusals reported; wanted 403, 0 and 1", resp.StatusCode, reached, len(reported))
+	}
 }
 
 // A refusal reaches the caller in the host's own word, not as a transport
