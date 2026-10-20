@@ -135,19 +135,25 @@ func TestVideoDriverResetStopsTheEngineAndQuarantinesTheRequest(t *testing.T) {
 // when the platform wrote no record.
 func TestVideoEngineDeviceLostLineIsAReset(t *testing.T) {
 	requireEnginePeer(t)
-	f := newVideoFixture(t, "--fake-generate=60s", "--fake-device-lost=1")
-	r := newGPURig(t)
-	h := f.host(t, newFakeLeases(), func(o *Options) {
-		o.GPU = r.guard
-		o.OnError = func(err error) { t.Logf("reported: %v", err) }
-	})
-	observed := awaitVideo(t, h, startVideo(t, h, videoRequest("job-1")), wire.VideoStateFailed, wire.VideoStateCompleted)
-	if observed.Status != wire.VideoStateFailed || observed.Reason != gpufault.WordReset {
-		t.Fatalf("observed %+v; log %q", observed, readFile(filepath.Dir(f.engine.Log), "sd-server.log"))
-	}
-	fault := nextGPUFault(t, r.faults)
-	if fault.Source != "sd-server: ErrorDeviceLost" || len(fault.Quarantined) != 1 {
-		t.Fatalf("fault %+v", fault)
+	// Repeated real exits exercise the ordering of the output reader, the
+	// engine's lifetime and the in-flight HTTP job read on both platforms.
+	for trial := range 20 {
+		t.Run(strconv.Itoa(trial), func(t *testing.T) {
+			f := newVideoFixture(t, "--fake-generate=60s", "--fake-device-lost=1")
+			r := newGPURig(t)
+			h := f.host(t, newFakeLeases(), func(o *Options) {
+				o.GPU = r.guard
+				o.OnError = func(err error) { t.Logf("reported: %v", err) }
+			})
+			observed := awaitVideo(t, h, startVideo(t, h, videoRequest("job-1")), wire.VideoStateFailed, wire.VideoStateCompleted)
+			if observed.Status != wire.VideoStateFailed || observed.Reason != gpufault.WordReset {
+				t.Fatalf("observed %+v; log %q", observed, readFile(filepath.Dir(f.engine.Log), "sd-server.log"))
+			}
+			fault := nextGPUFault(t, r.faults)
+			if fault.Source != "sd-server: ErrorDeviceLost" || len(fault.Quarantined) != 1 {
+				t.Fatalf("fault %+v", fault)
+			}
+		})
 	}
 }
 

@@ -116,7 +116,16 @@ func (g mediaGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	prefill := false
 	cut := ""
 	if h, ok := g.engines.(*Host); ok && req.Method == http.MethodPost && req.URL != nil {
+		checked := raw
 		raw, release, err = h.prepareCacheRequest(req.Context(), req.URL.Host, req.URL.Path, raw)
+		if errors.Is(err, errSlotHeld) {
+			// The title goes to another model's engine when one serves
+			// without evicting a resident model (titleModel); else 503.
+			if moved, ok := h.titleElsewhere(req, checked); ok {
+				return g.RoundTrip(moved)
+			}
+			return g.held(req, err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -198,6 +207,22 @@ func (g mediaGuard) refuse(req *http.Request, err error) (*http.Response, error)
 		"code": http.StatusForbidden, "type": "oa_media_refused", "message": err.Error()}})
 	return &http.Response{
 		Status: "403 Forbidden", StatusCode: http.StatusForbidden,
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)), Request: req,
+	}, nil
+}
+
+// held answers 503 in place of the engine for a title request that found
+// every resident slot holding a conversation and no other model to serve
+// it. inference reads it as the failure upstream:503; the engine is sent
+// nothing.
+func (g mediaGuard) held(req *http.Request, err error) (*http.Response, error) {
+	body, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"code": http.StatusServiceUnavailable, "type": "oa_slot_held", "message": err.Error()}})
+	return &http.Response{
+		Status: "503 Service Unavailable", StatusCode: http.StatusServiceUnavailable,
 		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
 		Header:        http.Header{"Content-Type": []string{"application/json"}},
 		Body:          io.NopCloser(bytes.NewReader(body)),

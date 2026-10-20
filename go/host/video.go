@@ -209,6 +209,14 @@ var errVideoEngineGone = errors.New("the video engine at this address is not run
 // table, so a process that took the port after the engine exited receives
 // no byte (inference CONTRACT.md INF-EL2, MODELHOST-L7).
 func (v *videoHost) engine(base string) (*http.Client, error) {
+	p, err := v.runningEngine(base)
+	if err != nil {
+		return nil, err
+	}
+	return p.client, nil
+}
+
+func (v *videoHost) runningEngine(base string) (*Process, error) {
 	v.mu.Lock()
 	p := v.process
 	v.mu.Unlock()
@@ -220,7 +228,7 @@ func (v *videoHost) engine(base string) (*http.Client, error) {
 		return nil, errVideoEngineGone
 	default:
 	}
-	return p.client, nil
+	return p, nil
 }
 
 // submit posts one checked body and returns the engine's job id.
@@ -294,8 +302,9 @@ func (v *videoHost) follow(ctx context.Context, op *videoOp, params sdcpp.VideoP
 			}
 			failures++
 			if failures >= maxEngineErrors || !v.host.videoAlive() {
+				reason := v.Lost(ctx, op)
 				v.host.resources.Unload(v.opts.Model, "video engine lost")
-				v.Finish(op, wire.VideoStateFailed, v.Lost(ctx, op), nil)
+				v.Finish(op, wire.VideoStateFailed, reason, nil)
 				return
 			}
 			continue
@@ -327,15 +336,25 @@ func (v *videoHost) follow(ctx context.Context, op *videoOp, params sdcpp.VideoP
 func (v *videoHost) read(ctx context.Context, base, job string) (sdcpp.VideoJob, error) {
 	call, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	client, err := v.engine(base)
+	p, err := v.runningEngine(base)
 	if err != nil {
 		return sdcpp.VideoJob{}, err
 	}
+	// Exited follows the engine's drained output. End a pending HTTP read
+	// there, while its reset record is still in the classification window.
+	// The caller's cancellation or read deadline also ends this waiter.
+	go func() {
+		select {
+		case <-p.exited:
+			cancel()
+		case <-call.Done():
+		}
+	}()
 	request, err := http.NewRequestWithContext(call, http.MethodGet, base+"/sdcpp/v1/jobs/"+job, nil)
 	if err != nil {
 		return sdcpp.VideoJob{}, err
 	}
-	response, err := client.Do(request)
+	response, err := p.client.Do(request)
 	if err != nil {
 		return sdcpp.VideoJob{}, err
 	}

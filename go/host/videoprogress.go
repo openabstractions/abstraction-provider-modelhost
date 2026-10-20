@@ -9,7 +9,7 @@ import (
 
 // sd-server master-843 reports no progress through its job route: a job
 // answer carries its status and queue position alone
-// (examples/server/async_jobs.cpp make_async_job_json), and the server sets
+// (stable-diffusion.cpp/examples/server/async_jobs.cpp make_async_job_json), and the server sets
 // no progress callback. The library prints a progress bar to the engine's
 // output instead (src/core/util.cpp print_progress_line): "  |====>   | 2/3 -
 // 1.58s/it", once per sampling step (src/stable-diffusion.cpp, the sample

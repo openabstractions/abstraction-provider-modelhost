@@ -96,6 +96,12 @@ func TestCacheSlotsProgramPartitionControlsPrefixReuse(t *testing.T) {
 	if body := request("failed", "program-a", true); body["cache_prompt"] != false {
 		t.Fatal("failed assignment supplied program evidence", body)
 	}
+	// The slot now holds program-a alone: a failed or canceled turn there
+	// keeps the conversation's slot and its prefix for the next turn.
+	interrupted := request("failed", "program-a", false)
+	if next := request("failed", "program-a", true); next["cache_prompt"] != true || next["id_slot"] != interrupted["id_slot"] {
+		t.Fatal("an interrupted turn on its own program's slot lost its prefix", interrupted, next)
+	}
 }
 
 func TestCacheSlotsAffinityReplacementAndCancellation(t *testing.T) {

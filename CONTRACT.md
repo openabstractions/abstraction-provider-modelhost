@@ -796,6 +796,11 @@ An engine whose requests name their cache slot runs with
 match from its one RAM prompt cache into a named slot, and that cache holds
 every partition's parked prompts. A named slot then reuses only what it
 holds itself, which the slot table keeps to one partition.
+A request that fails or is canceled on a slot that held nothing or only its own
+partition keeps that slot's conversation and partition: the slot holds only
+that partition's tokens, and the conversation's next turn reuses its prefix.
+A request that fails on a slot holding tokens of another or an unknown
+partition leaves the slot with no conversation and no partition.
 
 ## GPU faults
 

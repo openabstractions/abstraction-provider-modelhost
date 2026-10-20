@@ -477,7 +477,7 @@ that send a request to a running engine skip on macOS.
 
 ## Status
 
-Development provider for OA 0.3.0. The
+Provider module published with OpenAbstractions 0.8.0. The
 [Go source release](https://github.com/openabstractions/abstraction-provider-modelhost/releases/tag/go/v0.1.0)
 is tagged `go/v0.1.0`. This repository has no standalone release assets.
 The optional Windows installer feature is defined in the source tree. The

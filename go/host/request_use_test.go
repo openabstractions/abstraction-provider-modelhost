@@ -51,7 +51,12 @@ func TestRequestUseSettingsWithAndWithoutResidentSlots(t *testing.T) {
 					}
 				}
 				if resident {
-					if body["id_slot"] != float64(0) || body["cache_prompt"] != true {
+					// A title takes the highest empty slot; a conversation the lowest.
+					want := float64(0)
+					if title {
+						want = 1
+					}
+					if body["id_slot"] != want || body["cache_prompt"] != true {
 						t.Fatal("request-use row changed the admitted slot policy")
 					}
 				} else if body["id_slot"] != float64(7) || body["cache_prompt"] != false {

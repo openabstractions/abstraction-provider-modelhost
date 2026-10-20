@@ -56,6 +56,7 @@ func main() {
 	pidFile := flag.String("fake-pid-file", "", "write this engine's process id here")
 	noListen := flag.Bool("fake-no-listen", false, "start without serving, as an engine whose socket path another process took")
 	warmFile := flag.String("fake-warm-file", "", "append the prompt length of each /completion here")
+	tokenizeDelay := flag.Duration("fake-tokenize-delay", 0, "delay /tokenize until elapsed or its caller cancels")
 	completionGate := flag.String("fake-completion-gate", "", "hold each /completion until this file exists")
 	failLine := flag.String("fake-fail-line", "", "print this line to stderr and exit 1 before serving, as a load that failed")
 	flag.Bool("no-webui", false, "")
@@ -307,6 +308,15 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"prompt": prompt.String()})
 	})
 	mux.HandleFunc("/tokenize", func(w http.ResponseWriter, r *http.Request) {
+		if *tokenizeDelay > 0 {
+			timer := time.NewTimer(*tokenizeDelay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		var body struct {
 			Content string `json:"content"`
 		}

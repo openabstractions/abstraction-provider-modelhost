@@ -45,7 +45,7 @@ func TestCacheSlotsNewChatSendsOnlyItsOwnPrompt(t *testing.T) {
 	if probe, err := s.reserve(t.Context(), "chat-new", "opencode"); err != nil || probe.reused || probe.cause != "not_resident" || !probe.evicted {
 		t.Fatalf("the new chat's first lease should miss and evict the old chat: %+v %v", probe, err)
 	} else {
-		probe.release(false) // A failed lease clears the slot's scope, as if never assigned.
+		probe.release(false) // A failed lease on its own program's slot keeps the new chat's scope.
 	}
 	send("chat-old", old)
 

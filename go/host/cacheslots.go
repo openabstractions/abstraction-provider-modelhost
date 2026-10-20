@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"sync"
@@ -74,68 +75,13 @@ func (s *cacheSlots) reserve(ctx context.Context, scope string, partitions ...st
 				chosen, matching = i, true
 				break
 			}
-			if !slot.busy && (chosen < 0 || cacheSlotLess(slot, s.slots[chosen], scope == "")) {
+			if !slot.busy && (chosen < 0 || cacheSlotLess(slot, s.slots[chosen])) {
 				chosen = i
 			}
 		}
 		if chosen >= 0 && !s.slots[chosen].busy {
-			s.clock++
-			previous := s.slots[chosen]
-			if !matching && previous.occupied {
-				s.inflation = max(s.inflation, previous.keep)
-			}
-			current := cacheSlot{scope: scope, partition: partition, busy: true, used: s.clock, occupied: true, keep: s.inflation}
-			if matching {
-				current.cost, current.costKnown = previous.cost, previous.costKnown
-				current.keep += float64(current.cost)
-			}
-			s.slots[chosen] = current
-			epoch := s.clock
+			lease := s.takeLocked(chosen, scope, partition, matching)
 			s.mu.Unlock()
-			var once sync.Once
-			lease := &cacheSlotLease{id: chosen, reused: matching, cachePrompt: partition != "" && (!previous.occupied || previous.partition == partition), evicted: previous.scope != "" && !matching, cause: "not_resident"}
-			switch {
-			case partition == "":
-				lease.cause = "missing_partition"
-			case matching:
-				lease.cause = "resident"
-			case previous.occupied && previous.partition != partition:
-				lease.cause = "program_change"
-			case scope == "":
-				lease.cause = "unlabelled"
-			}
-			lease.observe = func(elapsed time.Duration, miss bool) {
-				if elapsed < 0 {
-					return
-				}
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				slot := &s.slots[chosen]
-				if !slot.busy || slot.used != epoch {
-					return
-				}
-				// Warm hits refresh recency with the saved refill cost; their
-				// cheap latency never replaces a long conversation's cost.
-				if miss {
-					slot.cost, slot.costKnown = elapsed, true
-				}
-				slot.keep = s.inflation + float64(slot.cost)
-			}
-			lease.release = func(complete bool) {
-				once.Do(func() {
-					s.mu.Lock()
-					defer s.mu.Unlock()
-					s.slots[chosen].busy = false
-					if !complete {
-						s.slots[chosen].scope = ""
-						s.slots[chosen].partition = ""
-						s.slots[chosen].cost, s.slots[chosen].costKnown = 0, false
-					}
-					s.slots[chosen].keep = s.inflation + float64(s.slots[chosen].cost)
-					close(s.changed)
-					s.changed = make(chan struct{})
-				})
-			}
 			return lease, nil
 		}
 		changed := s.changed
@@ -148,11 +94,139 @@ func (s *cacheSlots) reserve(ctx context.Context, scope string, partitions ...st
 	}
 }
 
-func cacheSlotLess(a, b cacheSlot, unlabelled bool) bool {
+// takeLocked gives the caller slot chosen for scope and partition. s.mu is
+// held by the caller and stays held.
+func (s *cacheSlots) takeLocked(chosen int, scope, partition string, matching bool) *cacheSlotLease {
+	s.clock++
+	previous := s.slots[chosen]
+	if !matching && previous.occupied {
+		s.inflation = max(s.inflation, previous.keep)
+	}
+	current := cacheSlot{scope: scope, partition: partition, busy: true, used: s.clock, occupied: true, keep: s.inflation}
+	if matching {
+		current.cost, current.costKnown = previous.cost, previous.costKnown
+		current.keep += float64(current.cost)
+	}
+	s.slots[chosen] = current
+	epoch := s.clock
+	var once sync.Once
+	var lease *cacheSlotLease
+	lease = &cacheSlotLease{id: chosen, reused: matching, cachePrompt: partition != "" && (!previous.occupied || previous.partition == partition), evicted: previous.scope != "" && !matching, cause: "not_resident"}
+	switch {
+	case partition == "":
+		lease.cause = "missing_partition"
+	case matching:
+		lease.cause = "resident"
+	case previous.occupied && previous.partition != partition:
+		lease.cause = "program_change"
+	case scope == "":
+		lease.cause = "unlabelled"
+	}
+	lease.observe = func(elapsed time.Duration, miss bool) {
+		if elapsed < 0 {
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		slot := &s.slots[chosen]
+		if !slot.busy || slot.used != epoch {
+			return
+		}
+		// Warm hits refresh recency with the saved refill cost; their
+		// cheap latency never replaces a long conversation's cost.
+		if miss {
+			slot.cost, slot.costKnown = elapsed, true
+		}
+		slot.keep = s.inflation + float64(slot.cost)
+	}
+	lease.release = func(complete bool) {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.slots[chosen].busy = false
+			// A canceled or failed request on a slot that held only its own
+			// program's prompts leaves only that program's tokens there,
+			// whatever the engine finished: the conversation keeps its slot
+			// and its next turn reuses the prefix the engine still holds
+			// (an interrupted OpenCode turn). A failure on a slot that held
+			// another program may have left that program's tokens, so it
+			// keeps no evidence.
+			if !complete && !lease.cachePrompt {
+				s.slots[chosen].scope = ""
+				s.slots[chosen].partition = ""
+				s.slots[chosen].cost, s.slots[chosen].costKnown = 0, false
+			}
+			s.slots[chosen].keep = s.inflation + float64(s.slots[chosen].cost)
+			close(s.changed)
+			s.changed = make(chan struct{})
+		})
+	}
+	return lease
+}
+
+// errSlotHeld is a title request on an engine whose resident slots all hold
+// a conversation or are its only slot; running it would evict that
+// conversation's prompt cache. The guard moves it to another model
+// (titleElsewhere) or answers 503.
+var errSlotHeld = errors.New("modelhost: every resident cache slot holds a conversation")
+
+// reserveSide reserves a slot for a title request, which carries no
+// conversation. It takes only a slot holding no conversation: one an earlier
+// title request used, else the highest-numbered empty slot (conversations
+// take the lowest). An engine with one slot keeps it for its conversation,
+// since an unpinned prefix warm may hold it, unless only is set: a title
+// moved to this engine may take its only slot when no conversation holds it.
+// With no such slot it answers errSlotHeld at once; a busy candidate is
+// waited for.
+func (s *cacheSlots) reserveSide(ctx context.Context, partition string, only bool) (*cacheSlotLease, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		chosen, waiting := -1, false
+		if len(s.slots) > 1 || only {
+			for i := len(s.slots) - 1; i >= 0; i-- {
+				slot := s.slots[i]
+				if slot.scope != "" {
+					continue
+				}
+				if slot.busy {
+					waiting = true
+					continue
+				}
+				if chosen < 0 || slot.occupied && !s.slots[chosen].occupied {
+					chosen = i
+				}
+			}
+		}
+		if chosen >= 0 {
+			lease := s.takeLocked(chosen, "", partition, false)
+			s.mu.Unlock()
+			return lease, nil
+		}
+		if !waiting {
+			s.mu.Unlock()
+			return nil, errSlotHeld
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// cacheSlotLess orders eviction victims: an empty slot, then a slot no
+// conversation holds (a title's, an unlabelled request's or a failed one's),
+// then the conversation with the least keep value.
+func cacheSlotLess(a, b cacheSlot) bool {
 	if a.occupied != b.occupied {
 		return !a.occupied
 	}
-	if unlabelled && (a.scope == "") != (b.scope == "") {
+	if (a.scope == "") != (b.scope == "") {
 		return a.scope == ""
 	}
 	if a.keep != b.keep {
@@ -203,7 +277,18 @@ func (h *Host) prepareScopedCacheRequest(ctx context.Context, host, path string,
 		}
 		return raw, nil, nil
 	}
-	lease, err := slots.reserve(ctx, scope, partition)
+	// A title request carries no conversation; it runs beside the resident
+	// conversations and never in their slot (CC-OPENCODE-TITLE-MODEL).
+	var lease *cacheSlotLease
+	var err error
+	if len(uses) != 0 && uses[0] == wire.ChatUseTitle {
+		// A title moved to this engine (titleElsewhere) may take its only
+		// slot; a title on its own model's engine leaves that to the chat.
+		moved, _ := ctx.Value(titleMovedKey{}).(bool)
+		lease, err = slots.reserveSide(ctx, partition, moved)
+	} else {
+		lease, err = slots.reserve(ctx, scope, partition)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

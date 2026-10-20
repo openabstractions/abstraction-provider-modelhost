@@ -332,13 +332,40 @@ func liveDiagnosticChat(t *testing.T, ctx context.Context, client *http.Client, 
 // GPU run never meets a broken harness.
 func TestPreloadMeasurementRunsOnTheStandInEngine(t *testing.T) {
 	requireEnginePeer(t)
-	steps := measurePreload(t, pinnedEngine(t), weightsFile(t, 4096), t.TempDir())
+	assertStandInPreloadMeasurement(t, pinnedEngine(t))
+}
+
+func TestPreloadMeasurementWaitsForTheStandInEngine(t *testing.T) {
+	requireEnginePeer(t)
+	engine := pinnedEngine(t)
+	// A tokenizer slower than the live measurement's one-second sampling
+	// interval makes its completion assumption fail without scheduler luck.
+	engine.fixture = append(engine.fixture, "--fake-tokenize-delay", "1100ms")
+	assertStandInPreloadMeasurement(t, engine)
+}
+
+// preloadMeasurementWaitEnd reserves cleanup time within the test's own deadline.
+func preloadMeasurementWaitEnd(t *testing.T) time.Time {
+	t.Helper()
+	if end, ok := t.Deadline(); ok {
+		return time.Now().Add(time.Until(end) * 19 / 20)
+	}
+	return time.Now().Add(10 * time.Minute) // go test -timeout=0
+}
+
+func assertStandInPreloadMeasurement(t *testing.T, engine Engine) {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(t.Context(), preloadMeasurementWaitEnd(t))
+	defer cancel()
+	steps := measurePreload(t, engine, weightsFile(t, 4096), t.TempDir(), preloadMeasurementOptions{
+		caller: ctx, waitForMidPreload: true,
+	})
 	want := map[string]string{"cold": "", "preloaded": "evaluated", "busy-after-turn": "busy", "changed": "evaluated",
 		"long-preloaded": "evaluated", "same-mid-preload": "evaluated", "changed-mid-preload": "evaluated"}
 	for _, s := range steps {
 		// The stand-in answers within the clock's resolution, so its reply is
-		// proved read by its usage, not by a positive time. Its preload ends
-		// before a request sent a second later arrives.
+		// proved read by its usage, not by a positive time. Completion orders
+		// the stand-in's preload before the following request.
 		asks := s.Name != "busy-after-turn" && s.Name != "long-preloaded"
 		if s.RequestError != "" || asks && s.PromptTokens == 0 || s.PreloadOutcome != want[s.Name] {
 			t.Errorf("step %+v", s)
@@ -384,8 +411,22 @@ func longSystem(system string) string {
 	return b.String()
 }
 
-// measurePreload runs the steps and returns them.
-func measurePreload(t *testing.T, engine Engine, model, out string) []preloadStep {
+type preloadMeasurementOptions struct {
+	caller            context.Context
+	waitForMidPreload bool
+}
+
+// measurePreload runs the steps and returns them. The live measurement keeps
+// its existing caller behavior; stand-in checks supply the test's lifetime.
+func measurePreload(t *testing.T, engine Engine, model, out string, options ...preloadMeasurementOptions) []preloadStep {
+	var coordination preloadMeasurementOptions
+	if len(options) != 0 {
+		coordination = options[0]
+	}
+	caller := context.Background()
+	if coordination.caller != nil {
+		caller = coordination.caller
+	}
 	if err := os.MkdirAll(out, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +487,7 @@ func measurePreload(t *testing.T, engine Engine, model, out string) []preloadSte
 		json.Unmarshal(body, &raw)
 		raw["max_tokens"] = json.RawMessage("512")
 		body, _ = json.Marshal(raw)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(caller, 5*time.Minute)
 		defer cancel()
 		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.Base(name)+chatPath, bytes.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
@@ -516,26 +557,49 @@ func measurePreload(t *testing.T, engine Engine, model, out string) []preloadSte
 	load := func(s preloadStep) preloadStep {
 		h.Unload(name, "measurement")
 		began := time.Now()
-		if _, err := h.Ensure(context.Background(), name); err != nil {
+		if _, err := h.Ensure(caller, name); err != nil {
 			t.Fatal(err)
 		}
 		s.LoadSeconds = time.Since(began).Seconds()
 		return s
 	}
-	preload := func(s preloadStep, system string) preloadStep {
+	preload := func(ctx context.Context, s preloadStep, system string) preloadStep {
 		began := time.Now()
-		outcome, reason, tokens := h.EvaluatePrefix(context.Background(), server, name, session.chatBody(t, []string{system}))
+		outcome, reason, tokens := h.EvaluatePrefix(ctx, server, name, session.chatBody(t, []string{system}))
 		s.PreloadSeconds, s.PreloadOutcome, s.PreloadReason, s.PreloadTokens = time.Since(began).Seconds(), outcome.String(), reason, tokens
 		return s
 	}
 	midPreload := func(s preloadStep, prefix, system string) preloadStep {
 		s = load(s)
 		offset := logSize()
+		warmCtx, cancel := context.WithCancel(caller)
+		defer cancel()
 		done := make(chan preloadStep, 1)
-		go func() { done <- preload(preloadStep{}, prefix) }()
-		time.Sleep(time.Second)
+		go func() { done <- preload(warmCtx, preloadStep{}, prefix) }()
+		joined := false
+		defer func() {
+			cancel()
+			if !joined {
+				<-done
+			}
+		}()
+		var ended preloadStep
+		if coordination.waitForMidPreload {
+			select {
+			case ended = <-done:
+				joined = true
+			case <-caller.Done():
+				t.Fatalf("stand-in preload did not complete within its caller: %v", caller.Err())
+			}
+		} else {
+			// The live GPU run samples while a long evaluation is running.
+			time.Sleep(time.Second)
+		}
 		s = ask(s, system, "What does this project do?")
-		ended := <-done
+		if !joined {
+			ended = <-done
+			joined = true
+		}
 		s.PreloadSeconds, s.PreloadOutcome, s.PreloadReason, s.PreloadTokens = ended.PreloadSeconds, ended.PreloadOutcome, ended.PreloadReason, ended.PreloadTokens
 		s.CancelLogged = strings.Contains(logSince(offset), "cancel task")
 		return s
@@ -543,11 +607,11 @@ func measurePreload(t *testing.T, engine Engine, model, out string) []preloadSte
 
 	var steps []preloadStep
 	steps = append(steps, ask(load(preloadStep{Name: "cold"}), session.System[0], "hi"))
-	steps = append(steps, ask(preload(load(preloadStep{Name: "preloaded"}), session.System[0]), session.System[0],
+	steps = append(steps, ask(preload(caller, load(preloadStep{Name: "preloaded"}), session.System[0]), session.System[0],
 		"Write a fizzbuzz function in fizzbuzz.py and add a short test."))
-	steps = append(steps, preload(preloadStep{Name: "busy-after-turn"}, session.System[0]))
-	steps = append(steps, ask(preload(load(preloadStep{Name: "changed"}), session.System[0]), moved(session.System[0]), "hi"))
-	steps = append(steps, preload(load(preloadStep{Name: "long-preloaded"}), long))
+	steps = append(steps, preload(caller, preloadStep{Name: "busy-after-turn"}, session.System[0]))
+	steps = append(steps, ask(preload(caller, load(preloadStep{Name: "changed"}), session.System[0]), moved(session.System[0]), "hi"))
+	steps = append(steps, preload(caller, load(preloadStep{Name: "long-preloaded"}), long))
 	steps = append(steps, midPreload(preloadStep{Name: "same-mid-preload"}, long, long))
 	steps = append(steps, midPreload(preloadStep{Name: "changed-mid-preload"}, long, moved(long)))
 	if steps[2].PreloadOutcome != wire.PreloadOutcomeBusy.String() {
